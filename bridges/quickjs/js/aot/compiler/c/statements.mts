@@ -19,6 +19,7 @@
  ---------------------------------------------------------------------------------------------------------------------*/
 
 import {cScalarType} from '../c-syntax.mts';
+import {printAnimationStart} from './animations.mts';
 import {printCondition, printExpr} from './expressions.mts';
 import {formatArgs, printText} from './text.mts';
 import type {IrExpr} from '../ir/expressions.mts';
@@ -197,11 +198,22 @@ function printStmt(stmt: IrStmt, indent: string): string[] {
       return [`${indent}${stmt.ref.cVar} ${stmt.op} ${printExpr(stmt.value)};`];
     case 'stepRef':
       return [`${indent}${stmt.ref.cVar}${stmt.op};`];
-    case 'stopAnimations':
-      return stmt.handles.map(
+    case 'stopAnimations': {
+      const lines = stmt.handles.map(
         handle =>
           `${indent}er_anim_value_set(${handle}, er_anim_value_get(${handle}));`,
       );
+      if (stmt.waitOwner === null) {
+        return lines;
+      }
+
+      // Waits are detached before a frozen value's completion can start a new run, and reported after it.
+      return [
+        `${indent}app_wait_detach(${stmt.waitOwner});`,
+        ...lines,
+        `${indent}app_wait_report(${stmt.waitOwner});`,
+      ];
+    }
     case 'if': {
       // Each branch is a nested C block.
       const lines = [
@@ -225,10 +237,12 @@ function printStmt(stmt: IrStmt, indent: string): string[] {
       return [`${indent}return;`];
     case 'armCleanup':
       return [`${indent}${stmt.flag} = 1;`];
+    case 'startAnimations':
+    case 'startChain':
+    case 'completeAfter':
+      return printAnimationStart(stmt);
     case 'foreign':
-      return stmt.isIndented
-        ? stmt.lines
-        : stmt.lines.map(line => indent + line);
+      return stmt.lines.map(line => indent + line);
   }
 }
 

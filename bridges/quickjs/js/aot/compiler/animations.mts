@@ -26,11 +26,23 @@ import {
   evalStaticOr,
 } from './static-eval.mts';
 import {i64Lit, floatLit} from './c-syntax.mts';
-import {INT_MAX, emitExpr} from './expressions.mts';
+import {INT_MAX, lowerExpr} from './expressions.mts';
 import {NO_WIDE, isFn} from './collect.mts';
-import {APP_UPDATE_CALL, compileStmts} from './handlers.mts';
+import {APP_UPDATE_CALL, lowerStmts} from './handlers.mts';
 import {isPanCreate} from './pan-responder.mts';
+import {printChainFunctions, printCompletionWait} from './c/animations.mts';
+import {printStmts} from './c/statements.mts';
 import type * as t from '@babel/types';
+import type {
+  IrAnimation,
+  IrAnimationStart,
+  IrAnimCurve,
+  IrCompleteAfter,
+  IrCompletion,
+  IrCompletionWait,
+  IrStartAnimations,
+  IrStartChain,
+} from './ir/animations.mts';
 import type {
   AnimRecord,
   Env,
@@ -79,14 +91,16 @@ export interface Interpolation {
   exRight: string;
 }
 
-/** How an on_complete chain repeats (see emitAnimChain). */
+/** How an on_complete chain repeats (see lowerChain). */
 interface LoopSpec {
   /** Repeats; negative loops forever. */
   iterations: number;
   /** The value to put back where it started before each repeat, or null. */
   resetTo: string | null;
-  /** Milliseconds before each repeat. */
+  /** Milliseconds before each repeat, and after the last pass before the loop completes. */
   trailingDelay: number;
+  /** The loop's composition key, which the wait after its last pass belongs to. */
+  key: string;
 }
 
 /*----------------------------------------------------------------------------------------------------------------------
@@ -376,32 +390,6 @@ function easingInfo(
 }
 
 /**
- * Pushes `cfg.easing = …;` (and bezier control points for Easing.bezier) onto a timing config's C lines.
- *
- * @param lines  The config's C lines, appended to.
- * @param configName  The config variable's name.
- * @param easingNode  The `easing:` expression, if there is one.
- * @param env  The expression environment.
- */
-function pushEasing(
-  lines: string[],
-  configName: string,
-  easingNode: t.Node | undefined,
-  env: Env,
-): void {
-  const {ease, bezier} = easingInfo(easingNode, env);
-  lines.push(`        ${configName}.easing = ${ease};`);
-  if (bezier) {
-    lines.push(
-      `        ${configName}.bezier_x1 = ${floatLit(bezier[0])}; ${configName}.bezier_y1 = ${floatLit(bezier[1])};`,
-    );
-    lines.push(
-      `        ${configName}.bezier_x2 = ${floatLit(bezier[2])}; ${configName}.bezier_y2 = ${floatLit(bezier[3])};`,
-    );
-  }
-}
-
-/**
  * Parses a `.interpolate({ inputRange, outputRange, extrapolate })` config object → a static
  * { input, output, exLeft, exRight } descriptor (ranges must be static, equal-length, 2..8 points).
  *
@@ -494,70 +482,56 @@ function animConfigGetter(cfgObj: t.Node | null | undefined): ConfigGetter {
 }
 
 /**
- * Emits one atomic animation (timing/spring/decay) → a scoped ERAnimConfig + er_anim_value_animate.
- * `delayMs` is the absolute start delay (how composition offsets are realized); `loop` repeats a timing;
- * `onCompleteCb` (optional) is a C function name set as cfg.on_complete — used to chain sequence steps.
+ * A folded config number that will be printed as a float, checked now so a value with no C form is reported
+ * where the animation is lowered.
+ *
+ * @param rawValue  The folded value.
+ *
+ * @returns The number.
+ */
+function configFloat(rawValue: unknown): number {
+  floatLit(rawValue);
+  return Number(rawValue);
+}
+
+/**
+ * Lowers one atomic animation (timing/spring/decay). `delayMs` is the absolute start delay (how composition
+ * offsets are realized) and `loop` repeats a timing on the engine's own loop.
  *
  * @param entry  The animation.
  * @param env  The expression environment.
- * @param idx  Makes the config variable's name unique within the body.
- * @param onCompleteCb  The C function to run when it completes, if any.
  *
- * @returns The C block that starts it.
+ * @returns The animation.
  */
-function emitAnimEntry(
-  entry: AnimEntry,
-  env: Env,
-  idx: string | number,
-  onCompleteCb: string | null | undefined,
-): string[] {
+function lowerAnimation(entry: AnimEntry, env: Env): IrAnimation {
   const {cVar, kind, get, delayMs, loop} = entry;
 
-  // Each emitted animation gets its own scoped ERAnimConfig local, so chained/parallel starts don't reuse state.
-  const configName = `cfg${idx}`;
-  const lines = [
-    '    {',
-    `        ERAnimConfig ${configName};`,
-    `        memset(&${configName}, 0, sizeof(${configName}));`,
-  ];
-
-  // Fill the type-specific config fields, using RN-like defaults when the app leaves a field out.
+  // Fold the curve's fields, using RN-like defaults when the app leaves one out.
+  let curve: IrAnimCurve;
   if (kind === 'spring') {
-    lines.push(`        ${configName}.type = ER_ANIM_SPRING;`);
-    lines.push(
-      `        ${configName}.stiffness = ${floatLit(evalStaticOr(get('stiffness'), env, 200))};`,
-    );
-    lines.push(
-      `        ${configName}.damping = ${floatLit(evalStaticOr(get('damping'), env, 18))};`,
-    );
-    lines.push(
-      `        ${configName}.mass = ${floatLit(evalStaticOr(get('mass'), env, 1))};`,
-    );
+    curve = {
+      kind: 'spring',
+      stiffness: configFloat(evalStaticOr(get('stiffness'), env, 200)),
+      damping: configFloat(evalStaticOr(get('damping'), env, 18)),
+      mass: configFloat(evalStaticOr(get('mass'), env, 1)),
+    };
   } else if (kind === 'decay') {
-    lines.push(`        ${configName}.type = ER_ANIM_DECAY;`);
-    lines.push(
-      `        ${configName}.deceleration = ${floatLit(evalStaticOr(get('deceleration'), env, 0.998))};`,
-    );
-    lines.push(
-      `        ${configName}.velocity = ${floatLit(evalStaticOr(get('velocity'), env, 0))};`,
-    );
+    curve = {
+      kind: 'decay',
+      deceleration: configFloat(evalStaticOr(get('deceleration'), env, 0.998)),
+      velocity: configFloat(evalStaticOr(get('velocity'), env, 0)),
+    };
   } else {
-    lines.push(`        ${configName}.type = ER_ANIM_TIMING;`);
-    lines.push(
-      `        ${configName}.duration_ms = ${Math.round(Number(evalStaticOr(get('duration'), env, 250)))};`,
+    const durationMs = Math.round(
+      Number(evalStaticOr(get('duration'), env, 250)),
     );
-    pushEasing(lines, configName, get('easing'), env);
-  }
-
-  // Add composition/control fields shared by all animation kinds.
-  if (delayMs > 0) {
-    lines.push(`        ${configName}.delay_ms = ${delayMs};`);
-  }
-  if (loop) {
-    lines.push(`        ${configName}.loop = true;`);
-  }
-  if (onCompleteCb) {
-    lines.push(`        ${configName}.on_complete = ${onCompleteCb};`);
+    const {ease, bezier} = easingInfo(get('easing'), env);
+    curve = {
+      kind: 'timing',
+      durationMs,
+      easing: ease,
+      bezier: bezier ? bezier.map(configFloat) : null,
+    };
   }
 
   // Decay is velocity-driven and has no toValue target; every other type needs one.
@@ -566,16 +540,13 @@ function emitAnimEntry(
     throw aotError(`AOT: Animated.${kind}() config needs a toValue`);
   }
 
-  // Start the engine animation, using the current value as decay's placeholder target.
-  const toCode = toNode
-    ? emitExpr(toNode, env).code
-    : `er_anim_value_get(${cVar})`;
-  lines.push(
-    `        er_anim_value_animate(${cVar}, (float)(${toCode}), &${configName});`,
-    '    }',
-  );
-
-  return lines;
+  return {
+    handle: cVar,
+    curve,
+    to: toNode ? lowerExpr(toNode, env) : null,
+    delayMs,
+    isLooping: loop,
+  };
 }
 
 /**
@@ -873,10 +844,11 @@ function sequenceSteps(
 }
 
 /**
- * Emits steps as an on_complete CHAIN: step 0 starts inline, and each step's completion callback starts the
+ * Lowers steps to an on_complete CHAIN: step 0 starts inline, and each step's completion callback starts the
  * next. Unlike the flat delay_ms path, this is correct when steps share a value — er_anim_value_animate
  * cancels the running anim on a value, so starting them together would cancel all but the last — and needs
- * no fixed duration. A step that is interrupted (finished == false) ends the chain, as it does in JS.
+ * no fixed duration. A step that is interrupted (finished == false) ends the chain, as it does in JS. The
+ * chain's callbacks and loop slots are added to the output here.
  *
  * `loop` makes the last step start the first again: {iterations (negative = forever), resetTo (the value to
  * put back where it started before each repeat, or null), trailingDelay (ms before each repeat)}.
@@ -884,84 +856,241 @@ function sequenceSteps(
  * @param steps  The chain's steps.
  * @param env  The expression environment.
  * @param ctx  The statement compiler's context.
- * @param doneCb  The completion callback to run when the chain ends, if any.
+ * @param completion  The completion callback to run when the chain ends, if any.
  * @param loop  How the chain repeats, or null for once.
+ * @param trailing  For a chain that runs once: the composition's key and the wait after its last step.
  *
- * @returns The C that starts step 0.
+ * @returns The chain.
  */
-function emitAnimChain(
+function lowerChain(
   steps: AnimEntry[],
   env: Env,
   ctx: StatementContext,
-  doneCb: string | null,
+  completion: IrCompletion | null,
   loop: LoopSpec | null = null,
-): string[] {
+  trailing: {key: string; delayMs: number} | null = null,
+): IrStartChain {
   // GLOBAL: callback names are file-scope, so must be unique across handlers
-  const seqId = ctx.out.seqN++;
-  const cb = (i: number) => `er_seqcb_${seqId}_${i}`;
-  const done = (finished: string) =>
-    doneCb ? [`        ${doneCb}(${finished}, NULL);`] : [];
-  const interrupted = [
-    '    if (!finished)',
-    '    {',
-    ...done('false'),
-    '        return;',
-    '    }',
-  ];
+  const id = ctx.out.seqN++;
 
-  // Built from the tail so each step knows its successor's callback name.
-  const last = loop ? cb(0) : doneCb;
-  for (let index = steps.length - 1; index >= 1; index--) {
-    const next = index < steps.length - 1 ? cb(index + 1) : last;
-    ctx.out.animCbs.push({
-      name: cb(index),
-      body: [
-        ...interrupted,
-        ...emitAnimEntry(steps[index], env, `${seqId}_${index}`, next),
-      ],
-    });
+  // Lowered from the tail, the order the callbacks are emitted in.
+  const lowered: IrAnimation[] = new Array(steps.length);
+  for (let index = steps.length - 1; index >= 0; index--) {
+    lowered[index] = lowerAnimation(steps[index], env);
   }
 
-  // Start the first step inline; it either chains to step 1 or to the final completion callback.
-  const next0 = steps.length > 1 ? cb(1) : last;
-  const first = emitAnimEntry(steps[0], env, `${seqId}_0`, next0);
-  if (!loop) return first;
+  // A repeat restarts step 0 after any trailing sequence delay.
+  const chain: IrStartChain = {
+    kind: 'startChain',
+    id,
+    steps: lowered,
+    loop: loop
+      ? {
+          iterations: loop.iterations,
+          resetHandle: loop.resetTo,
+          restart: lowerAnimation(
+            {...steps[0], delayMs: steps[0].delayMs + loop.trailingDelay},
+            env,
+          ),
+          finalWait:
+            loop.iterations >= 0 && completion && loop.trailingDelay > 0
+              ? {
+                  delayMs: loop.trailingDelay,
+                  owner: waitOwner(ctx, loop.key, true),
+                }
+              : null,
+        }
+      : null,
+    completion,
+    completionWait:
+      !loop && completion && trailing && trailing.delayMs > 0
+        ? completionWait(
+            ctx,
+            trailing.key,
+            trailing.delayMs,
+            `er_seqcb_${id}_${steps.length}`,
+          )
+        : null,
+  };
 
-  // The repeat: cb(0) runs when the last step finishes and starts step 0 again.
-  const lines: string[] = [];
-  const repeat = [...interrupted];
-  if (loop.iterations >= 0) {
-    const passCount = `s_loop${seqId}_n`;
-    ctx.out.effectDecls.push(`static int ${passCount};`);
-    lines.push(`    ${passCount} = 1;`);
-    repeat.push(
-      `    if (${passCount} >= ${loop.iterations})`,
-      '    {',
-      ...done('true'),
-      '        return;',
-      '    }',
-      `    ${passCount}++;`,
-    );
-  }
+  const {callbacks, decls} = printChainFunctions(chain);
+  ctx.out.animCbs.push(...callbacks);
+  ctx.out.effectDecls.push(...decls);
 
-  // Capture the value at loop start so each repeat can resetBeforeIteration back to it.
-  if (loop.resetTo) {
-    const from = `s_loop${seqId}_from`;
-    ctx.out.effectDecls.push(`static float ${from};`);
-    lines.push(`    ${from} = er_anim_value_get(${loop.resetTo});`);
-    repeat.push(`    er_anim_value_set(${loop.resetTo}, ${from});`);
-  }
-
-  // Restart from step 0, adding any trailing sequence delay before the next iteration.
-  const again = {...steps[0], delayMs: steps[0].delayMs + loop.trailingDelay};
-  repeat.push(...emitAnimEntry(again, env, `${seqId}_0`, next0));
-  ctx.out.animCbs.push({name: cb(0), body: repeat});
-
-  return [...lines, ...first];
+  return chain;
 }
 
 /**
- * Compiles `Animated.loop(animation, config?).start()`, or returns null for the flat path. An endless loop of
+ * A start with nothing to run.
+ *
+ * @param ctx  The statement compiler's context.
+ * @param completion  The completion callback, if any; it never runs.
+ *
+ * @returns The start.
+ */
+const emptyStart = (
+  ctx: StatementContext,
+  completion: IrCompletion | null,
+): IrStartAnimations => ({
+  kind: 'startAnimations',
+  animations: [],
+  firstConfig: ctx.animIdx,
+  completion,
+  completionWait: null,
+});
+
+/** Numbers each composition node once, so a key names the place it is written. */
+const compositionIds = new WeakMap<t.Node, number>();
+let nextCompositionId = 0;
+
+/**
+ * What identifies a composition as the owner of its completion waits: where it is written, within one component
+ * instance. Each run still waits on its own; the owner is what a stop names, so it ends the runs of the
+ * composition it stops and no other. A start and stop through the same local (`const pulse = …; pulse.start();
+ * … pulse.stop()`) reach the same node.
+ *
+ * @param node  The composition, resolved.
+ * @param env  The expression environment.
+ *
+ * @returns The key.
+ */
+function compositionKey(node: t.Node | null | undefined, env: Env): string {
+  let id = node ? compositionIds.get(node) : -1;
+  if (id === undefined) {
+    id = nextCompositionId++;
+    compositionIds.set(node!, id);
+  }
+
+  return `${env.cbPrefix ?? ''}|${id}`;
+}
+
+/**
+ * The owner number completion waits of a composition carry, so a stop can end them; numbered on first use.
+ *
+ * @param ctx  The statement compiler's context.
+ * @param key  The composition's key.
+ * @param isStart  A start is asking, so the waits are real (a stop alone leaves nothing to end).
+ *
+ * @returns The owner.
+ */
+function waitOwner(
+  ctx: StatementContext,
+  key: string,
+  isStart: boolean,
+): number {
+  let record = ctx.out.animWaits.get(key);
+  if (!record) {
+    record = {owner: ctx.out.animWaits.size, isStarted: false};
+    ctx.out.animWaits.set(key, record);
+  }
+  if (isStart) {
+    record.isStarted = true;
+  }
+
+  return record.owner;
+}
+
+/**
+ * True when a composition has an Animated.delay anywhere, the only thing a completion can wait on.
+ *
+ * @param node  The composition.
+ * @param env  The expression environment.
+ *
+ * @returns Whether it does.
+ */
+function hasDelay(node: t.Node | null | undefined, env: Env): boolean {
+  node = resolveAnim(node, env);
+  if (!isAnimatedCall(node)) return false;
+
+  // Look through compositions; a timing, spring or decay waits on nothing beyond itself.
+  const kind = node.callee.property.name;
+  const args = node.arguments;
+  if (kind === 'delay') return true;
+  if (kind === 'loop') return hasDelay(args[0], env);
+  if (kind === 'sequence' || kind === 'parallel' || kind === 'stagger') {
+    const list = kind === 'stagger' ? args[1] : args[0];
+    return (
+      list?.type === 'ArrayExpression' &&
+      list.elements.some(child => child && hasDelay(child, env))
+    );
+  }
+
+  return false;
+}
+
+/**
+ * The composition whose completion waits `anim.stop()` ends, when it has a delay to wait on.
+ *
+ * @param node  The composition being stopped.
+ * @param env  The expression environment.
+ * @param ctx  The statement compiler's context.
+ *
+ * @returns The owner, or null.
+ */
+export function stopWaitOwner(
+  node: t.Node | null | undefined,
+  env: Env,
+  ctx: StatementContext,
+): number | null {
+  const resolved = resolveAnim(node, env);
+  return hasDelay(resolved, env)
+    ? waitOwner(ctx, compositionKey(resolved, env), false)
+    : null;
+}
+
+/**
+ * The wait between a composition's last animation finishing and its completion running.
+ *
+ * @param ctx  The statement compiler's context.
+ * @param key  The composition's key.
+ * @param delayMs  The wait.
+ * @param callback  The name of the on_complete callback that starts it.
+ *
+ * @returns The wait.
+ */
+const completionWait = (
+  ctx: StatementContext,
+  key: string,
+  delayMs: number,
+  callback: string,
+): IrCompletionWait => ({delayMs, callback, owner: waitOwner(ctx, key, true)});
+
+/**
+ * A start that drives no value. As in JS, its completion still runs as finished once the composition's delays
+ * have passed, counted down in a completion wait of its own.
+ *
+ * @param ctx  The statement compiler's context.
+ * @param completion  The completion callback, if any.
+ * @param delayMs  How long the composition takes.
+ * @param key The composition's key.
+ *
+ * @returns The start.
+ */
+function startNothing(
+  ctx: StatementContext,
+  completion: IrCompletion | null,
+  delayMs: number,
+  key: string,
+): IrStartAnimations | IrCompleteAfter {
+  if (!completion) {
+    return emptyStart(ctx, completion);
+  }
+
+  const start: IrCompleteAfter = {
+    kind: 'completeAfter',
+    completion,
+    delayMs,
+    owner: null,
+  };
+  if (delayMs > 0) {
+    start.owner = waitOwner(ctx, key, true);
+  }
+
+  return start;
+}
+
+/**
+ * Lowers `Animated.loop(animation, config?).start()`, or returns null for the flat path. An endless loop of
  * one timing is the engine's own cfg.loop; anything else (a sequence, a spring or decay, a counted loop) is a
  * chain whose last step starts the first again. As in JS, a looped single animation goes back to where it
  * started before each repeat (resetBeforeIteration), and a looped sequence carries on from where it ended.
@@ -969,16 +1098,18 @@ function emitAnimChain(
  * @param loopNode  The `Animated.loop(…)` call.
  * @param env  The expression environment.
  * @param ctx  The statement compiler's context.
- * @param doneCb  The completion callback to run when the loop ends, if any.
+ * @param completion  The completion callback to run when the loop ends, if any.
+ * @param key  The loop's composition key.
  *
- * @returns The C that starts it, or null when the flat path (the engine's own cfg.loop) handles it.
+ * @returns The start, or null when the flat path (the engine's own cfg.loop) handles it.
  */
-function compileLoopStart(
+function lowerLoopStart(
   loopNode: AnimatedCall,
   env: Env,
   ctx: StatementContext,
-  doneCb: string | null,
-): string[] | null {
+  completion: IrCompletion | null,
+  key: string,
+): IrAnimationStart | null {
   // Fold the loop count at build time; absent or noninteger iterations mean repeat forever.
   const inner = resolveAnim(loopNode.arguments[0], env);
   const kind = isAnimatedCall(inner) ? inner.callee.property.name : null;
@@ -1020,14 +1151,21 @@ function compileLoopStart(
     );
   }
 
-  // Nothing to start for an empty sequence.
-  if (!steps.length) {
-    return [];
-  }
-
   // A zero-iteration loop starts nothing but still reports successful completion.
   if (iterations === 0) {
-    return doneCb ? [`    ${doneCb}(true, NULL);`] : [];
+    return startNothing(ctx, completion, 0, key);
+  }
+
+  // A loop of delays alone completes after its passes; an endless one never does.
+  if (!steps.length) {
+    return iterations < 0
+      ? emptyStart(ctx, completion)
+      : startNothing(
+          ctx,
+          completion,
+          Math.min(iterations * trailingDelay, INT_MAX),
+          key,
+        );
   }
 
   // A timing with no duration and no delay completes inside er_anim_value_animate, so a loop made only of
@@ -1043,30 +1181,32 @@ function compileLoopStart(
     );
   }
 
-  return emitAnimChain(steps, env, ctx, doneCb, {
+  return lowerChain(steps, env, ctx, completion, {
     iterations,
     resetTo,
     trailingDelay,
+    key,
   });
 }
 
 /**
- * Compiles a `.start(onComplete)` completion callback to a file-scope C fn (ERAnimCompleteFn) set as the
- * animation's on_complete; its body runs setters/refs/etc. and re-applies state via app_update if needed.
+ * Lowers a `.start(onComplete)` completion callback to a file-scope C fn (ERAnimCompleteFn) set as the
+ * animation's on_complete, and adds it to the output; its body runs setters/refs/etc. and re-applies state via
+ * app_update if needed.
  *
  * @param fnNode  The callback.
  * @param env  The expression environment.
  * @param state  The component's state table.
  * @param ctx  The statement compiler's context.
  *
- * @returns The C function's name.
+ * @returns The completion.
  */
-function emitCompletionCb(
+function lowerCompletion(
   fnNode: FunctionNode,
   env: Env,
   state: StateTable,
   ctx: StatementContext,
-): string {
+): IrCompletion {
   // Generate a file-scope completion callback and expose start(({finished}) => ...) as a local C int.
   const id = ctx.out.seqN++;
   const name = `er_donecb_${id}`;
@@ -1086,82 +1226,128 @@ function emitCompletionCb(
     }
   }
 
-  // Compile the callback body as statements, then re-render if it changed React state.
-  const body = fnNode.body;
+  // Lower the callback body as statements; it re-renders if it changed React state.
+  const fnBody = fnNode.body;
   const list: t.Statement[] =
-    body.type === 'BlockStatement'
-      ? body.body
-      : [{type: 'ExpressionStatement', expression: body}];
+    fnBody.type === 'BlockStatement'
+      ? fnBody.body
+      : [{type: 'ExpressionStatement', expression: fnBody}];
   const cctx: StatementContext = {
     stateChanged: false,
     animIdx: 0,
     out: ctx.out,
   };
-  const lines = compileStmts(list, {...env, locals}, state, cctx, '    ');
-  if (cctx.stateChanged) {
+  const body = lowerStmts(list, {...env, locals}, state, cctx);
+  const completion = {name, body, updatesState: cctx.stateChanged};
+
+  const lines = printStmts(body, '    ');
+  if (completion.updatesState) {
     lines.push(APP_UPDATE_CALL);
   }
-
   ctx.out.animCbs.push({name, body: lines});
 
-  return name;
+  return completion;
 }
 
 /**
- * Compiles `<animation>.start()` — a single Animated.timing/spring/decay or a composition
+ * Lowers `<animation>.start()` — a single Animated.timing/spring/decay or a composition
  * (sequence/parallel/stagger/delay/loop). A sequence, and a loop the engine cannot repeat on its own, become
- * an on_complete chain (emitAnimChain); everything else flattens to one ERAnimConfig + er_anim_value_animate
- * per atomic entry, composition expressed through per-entry delay_ms. Native-driven; sets no React state.
+ * an on_complete chain (lowerChain); everything else flattens to one animation per atomic entry, composition
+ * expressed through per-entry delay_ms. Native-driven; sets no React state.
  *
  * @param expr  The `.start(…)` call.
  * @param env  The expression environment.
  * @param state  The component's state table.
  * @param ctx  The statement compiler's context.
  *
- * @returns The C that starts the animation.
+ * @returns The start.
  */
-export function compileAnimateStart(
+export function lowerAnimateStart(
   expr: t.CallExpression,
   env: Env,
   state: StateTable,
   ctx: StatementContext,
-): string[] {
+): IrAnimationStart {
   // Resolve the animation being started and handle cases that need callback chaining before falling back to flat emission.
-  const doneCb = isFn(expr.arguments[0])
-    ? emitCompletionCb(expr.arguments[0], env, state, ctx)
+  const completion = isFn(expr.arguments[0])
+    ? lowerCompletion(expr.arguments[0], env, state, ctx)
     : null;
   const receiver = resolveAnim((expr.callee as t.MemberExpression).object, env);
   const kind = isAnimatedCall(receiver) ? receiver.callee.property.name : null;
+  const key = compositionKey(receiver, env);
   if (kind === 'sequence') {
-    const {steps} = sequenceSteps(receiver as AnimatedCall, env);
-    return steps.length ? emitAnimChain(steps, env, ctx, doneCb) : [];
+    const {steps, trailingDelay} = sequenceSteps(receiver as AnimatedCall, env);
+    return steps.length
+      ? lowerChain(steps, env, ctx, completion, null, {
+          key,
+          delayMs: trailingDelay,
+        })
+      : startNothing(ctx, completion, trailingDelay, key);
   }
   if (kind === 'loop') {
-    const lines = compileLoopStart(receiver as AnimatedCall, env, ctx, doneCb);
-    if (lines) return lines;
+    const start = lowerLoopStart(
+      receiver as AnimatedCall,
+      env,
+      ctx,
+      completion,
+      key,
+    );
+    if (start) return start;
   }
 
   // The flat path has no "after all entries finish" join point, so completion callbacks are limited to one entry.
-  const {entries} = flattenAnim(receiver, env, 0, false);
-  if (doneCb && entries.length > 1) {
+  const {entries, duration} = flattenAnim(receiver, env, 0, false);
+  if (!entries.length) {
+    return startNothing(ctx, completion, duration ?? 0, key);
+  }
+  if (completion && entries.length > 1) {
     throw aotError(
       'AOT: a .start(onComplete) callback on a parallel/stagger animation is not yet supported',
       'attach the completion callback to a single animation or an Animated.sequence(...). For "after all parallel anims", restructure as a sequence.',
     );
   }
 
-  // Emit each flattened entry independently; when allowed, attach completion to the final emitted entry.
-  const lines: string[] = [];
-  entries.forEach((animEntry: AnimEntry, index) =>
-    lines.push(
-      ...emitAnimEntry(
-        animEntry,
-        env,
-        ctx.animIdx++,
-        index === entries.length - 1 ? doneCb : null,
-      ),
-    ),
-  );
+  // A spring or decay has no fixed end, so a delay beside it that runs past its start cannot be waited out yet.
+  const [only] = entries;
+  if (
+    completion &&
+    only &&
+    only.kind !== 'timing' &&
+    !only.loop &&
+    duration != null &&
+    duration > only.delayMs
+  ) {
+    throw aotError(
+      `AOT: a .start(onComplete) callback on an Animated.${only.kind} beside a longer Animated.delay is not yet supported`,
+      `a ${only.kind} has no fixed length, so the callback cannot wait for whichever ends last. Run them in an ` +
+        'Animated.sequence([...]) instead, or drop the delay.',
+    );
+  }
 
-  return lines;
+  // Each entry starts on its own, numbered after the configs already in this body.
+  const start = emptyStart(ctx, completion);
+  for (const animEntry of entries) {
+    start.animations.push(lowerAnimation(animEntry, env));
+    ctx.animIdx++;
+  }
+
+  // A delay beside the one timing that outlasts it holds the completion back until the composition ends.
+  if (completion && only?.kind === 'timing' && !only.loop && duration != null) {
+    const end =
+      only.delayMs +
+      Math.round(Number(evalStaticOr(only.get('duration'), env, 250)));
+    if (duration > end) {
+      start.completionWait = completionWait(
+        ctx,
+        key,
+        duration - end,
+        `er_waitcb_${ctx.out.seqN++}`,
+      );
+      ctx.out.animCbs.push(
+        printCompletionWait(completion, start.completionWait),
+      );
+    }
+  }
+
+  return start;
 }

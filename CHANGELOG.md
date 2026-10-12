@@ -38,6 +38,15 @@ See [Releasing](https://embedded-react.dev/internals/releasing) for the release 
 - A Flow B `Math.<name>` or `e.layout.<name>` that names a built-in object property (`Math.toString`,
   say) fails with an `AOT:` error. It used to compile to invalid C.
 
+- In Flow B, a `.start(onComplete)` on an animation that moves nothing (an empty `sequence`, `parallel` or
+  `stagger`, or only delays) calls its callback once the delays have passed, as Flow A does. It used to never
+  call it.
+
+- In Flow B, a `.start(onComplete)` waits out a delay that ends a `sequence`, or a delay that outlasts the timing
+  beside it, before calling its callback. It used to call it as soon as the last animation finished. Stopping
+  the animation during that wait calls the callback with `finished: false`, as React Native does. A callback on a
+  spring or decay beside a longer delay is now an `AOT:` error, since a spring has no fixed length to wait against.
+
 - An auto-height row with `flexWrap: 'wrap'` grows to hold every wrapped line. It used to reserve a single line's
   height, so the lines below painted over the siblings that follow it. Measurement now takes the width the parent
   offers and breaks the row into lines at that width, as Yoga does.

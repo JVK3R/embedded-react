@@ -48,6 +48,7 @@ import {emitNode} from './nodes.mts';
 import {compileKeyboardConfig} from './keyboard.mts';
 import {normalizeUndefined, parseApp} from './parse.mts';
 import {Out} from './out.mts';
+import {printWaitDeclarations} from './c/animations.mts';
 import type {BlockStatement} from '@babel/types';
 import type {ResolvedOptions} from './options.mts';
 import type {
@@ -358,6 +359,30 @@ export function compileSourceImpl(
     out.mountEffects = dropUpdate(out.mountEffects);
   }
 
+  // A composition that no start waits on has no waits for a stop to end, so its stop calls go.
+  const idleWaitStops = [...out.animWaits.values()]
+    .filter(record => !record.isStarted)
+    .flatMap(record => [
+      `app_wait_detach(${record.owner});`,
+      `app_wait_report(${record.owner});`,
+    ]);
+  const usesWaits = [...out.animWaits.values()].some(
+    record => record.isStarted,
+  );
+  if (idleWaitStops.length) {
+    const dropIdleStops = (lines: string[]) =>
+      lines.filter(line => !idleWaitStops.includes(line.trim()));
+    for (const cFunction of [
+      ...out.handlers,
+      ...out.timerFns,
+      ...out.animCbs,
+      ...out.effectFns,
+    ]) {
+      cFunction.body = dropIdleStops(cFunction.body!);
+    }
+    out.mountEffects = dropIdleStops(out.mountEffects);
+  }
+
   // app_update(): re-apply state-driven node props, rebuild state-driven Svgs, then run dep-driven effects.
   const updateBlock = (() => {
     if (!hasUpdate) return '';
@@ -519,10 +544,12 @@ static int er_timer_add(int ms, bool repeat, void (*fn)(void))
     : '';
 
   // er_app_tick(): fire due timers; without timers it only applies a clock change, so a host can always call it.
+  // Completion waits count down on the app loop too.
+  const waitTick = usesWaits ? '    app_wait_tick(dt_ms);\n' : '';
   const appTickFn = out.usesTimers
     ? `void er_app_tick(int dt_ms)
 {
-${wallClockRefresh}    for (int i = 0; i < ER_AOT_MAX_TIMERS; i++)
+${wallClockRefresh}${waitTick}    for (int i = 0; i < ER_AOT_MAX_TIMERS; i++)
     {
         if (!s_timers[i].active)
         {
@@ -551,7 +578,7 @@ ${wallClockRefresh}    for (int i = 0; i < ER_AOT_MAX_TIMERS; i++)
         }
     }
 }`
-    : `void er_app_tick(int dt_ms)\n{\n    (void)dt_ms;\n${wallClockRefresh}}`;
+    : `void er_app_tick(int dt_ms)\n{\n    (void)dt_ms;\n${wallClockRefresh}${waitTick}}`;
 
   // useEffect(fn, []) bodies, run once at the end of er_app_build().
   const mountEffectsBlock = out.mountEffects.length
@@ -929,6 +956,9 @@ static int16_t app_round_dim(double v)
   ].join('\n\n');
   // <limits.h> when a helper saturates at INT_MAX / INT_MIN.
   const usesLimits = /\bINT_M(?:AX|IN)\b/.test(clockBlock);
+  // Animation completion waits: their table, and the helpers the generated code calls.
+  const animWaitBlock = usesWaits ? printWaitDeclarations(helperCallers) : '';
+
   // Emit er_timer_clear only when called; a clearInterval in a dropped mount-effect cleanup leaves no caller.
   const timerClearBlock =
     out.usesTimers && helperCallers.includes('er_timer_clear(')
@@ -970,6 +1000,7 @@ static int16_t app_round_dim(double v)
     handleDecls,
     timerTableBlock,
     timerClearBlock,
+    animWaitBlock,
     effectFwdDecls,
     updateBlock,
     timerFnFwdDecls,

@@ -29,6 +29,7 @@ import {fileURLToPath} from 'node:url';
 import {tmpdir} from 'node:os';
 import {spawnSync} from 'node:child_process';
 import {compileSource, bakeSvgArtifacts} from '../compile.mts';
+import {printWaitDeclarations} from '../compiler/c/animations.mts';
 
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '../../../../..');
 const demosDir = join(root, 'demos');
@@ -241,6 +242,35 @@ describe('AOT generated C compiles', () => {
          }`,
         'loops',
       );
+      // Completion waits: a sequence's trailing delay stopped by a cleanup, a delay alone, and a stop of a
+      // composition nothing waits on (its slot is dropped).
+      const waits = compileSource(
+        `import { useState, useEffect } from 'react';
+         import { View, Animated, useAnimatedValue } from 'embedded-react';
+         export function App() {
+           const [n, setN] = useState(0);
+           const a = useAnimatedValue(0);
+           useEffect(() => {
+             const pulse = Animated.sequence([Animated.timing(a, { toValue: 1 }), Animated.delay(300)]);
+             pulse.start(({ finished }) => setN(finished ? 1 : 2));
+             return () => pulse.stop();
+           }, [n]);
+           return (
+             <View
+               onPress={() => {
+                 Animated.delay(500).start(() => setN(3));
+                 Animated.parallel([Animated.timing(a, { toValue: 0 }), Animated.delay(900)]).stop();
+               }}
+               style={{ flex: 1, opacity: a, width: n }}
+             />
+           );
+         }`,
+        'waits',
+      );
+      expect(waits.c).toContain('app_wait_start(0, 500, er_donecb_0);');
+      expect(waits.c).toContain('app_wait_detach(2);');
+      expect(waits.c).toContain('app_wait_tick(dt_ms);');
+      expect(waits.c).not.toContain('app_wait_detach(1);');
       for (const [name, r] of [
         [
           'starter',
@@ -250,6 +280,7 @@ describe('AOT generated C compiles', () => {
           }),
         ],
         ['loops', loops],
+        ['waits', waits],
       ]) {
         const dir = mkdtempSync(join(tmpdir(), `er-aot-cc-${name}-`));
         try {
@@ -273,6 +304,101 @@ describe('AOT generated C compiles', () => {
         } finally {
           rmSync(dir, {recursive: true, force: true});
         }
+      }
+    },
+  );
+
+  (CC ? it : it.skip)(
+    `completion waits run independently, and a stop ends only its own (${CC || 'no cc found'})`,
+    () => {
+      // Runs the generated wait helpers: separate runs of one composition, a stop, and completions that start new
+      // runs from inside a stop.
+      const harness = `#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+typedef void (*ERAnimCompleteFn)(bool finished, void* user_data);
+${printWaitDeclarations('app_wait_start( app_wait_detach(')}
+
+static char s_log[256];
+static void done_a(bool finished, void* user_data)
+{
+    (void)user_data;
+    strcat(s_log, finished ? "A+" : "A-");
+}
+static void done_b(bool finished, void* user_data)
+{
+    (void)user_data;
+    strcat(s_log, finished ? "B+" : "B-");
+}
+static void done_restart(bool finished, void* user_data)
+{
+    (void)user_data;
+    strcat(s_log, finished ? "R+" : "R-");
+    if (!finished)
+    {
+        app_wait_start(1, 100, done_b);
+    }
+}
+
+int main(void)
+{
+    app_wait_start(0, 100, done_a);
+    app_wait_start(0, 150, done_a);
+    app_wait_tick(120);
+    app_wait_tick(40);
+    strcat(s_log, "|");
+
+    app_wait_start(0, 100, done_a);
+    app_wait_start(2, 100, done_b);
+    app_wait_detach(0);
+    app_wait_report(0);
+    app_wait_tick(200);
+    strcat(s_log, "|");
+
+    app_wait_start(1, 100, done_restart);
+    app_wait_detach(1);
+    app_wait_report(1);
+    app_wait_tick(200);
+    strcat(s_log, "|");
+
+    app_wait_start(1, 100, done_a);
+    app_wait_detach(1);
+    app_wait_start(1, 100, done_b);
+    app_wait_report(1);
+    app_wait_tick(200);
+    strcat(s_log, "|");
+
+    for (int i = 0; i < ER_AOT_MAX_WAITS; i++)
+    {
+        app_wait_start(3, 100, done_b);
+    }
+    app_wait_start(3, 100, done_a);
+    strcat(s_log, "/");
+    app_wait_tick(200);
+    puts(s_log);
+    return 0;
+}
+`;
+      const dir = mkdtempSync(join(tmpdir(), 'er-aot-waits-'));
+      try {
+        writeFileSync(join(dir, 'waits.c'), harness);
+        const exe = join(dir, 'waits.exe');
+        const build = spawnSync(
+          CC,
+          ['-Wall', '-Werror', join(dir, 'waits.c'), '-o', exe],
+          {encoding: 'utf8'},
+        );
+        expect(build.stderr || '').toBe('');
+        expect(build.status).toBe(0);
+        const run = spawnSync(exe, [], {encoding: 'utf8'});
+        // Both taps complete; the stop ends owner 0 only; a run started by the stop's completion, or between
+        // detach and report, survives; a run that finds the table full ends at once, as not finished.
+        expect(run.stdout.trim()).toBe(
+          'A+A+|A-B+|R-B+|A-B+|A-/' + 'B+'.repeat(8),
+        );
+      } finally {
+        rmSync(dir, {recursive: true, force: true});
       }
     },
   );
