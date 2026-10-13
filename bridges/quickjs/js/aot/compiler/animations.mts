@@ -18,6 +18,7 @@
  - Imports
  ---------------------------------------------------------------------------------------------------------------------*/
 
+import {check, checkNumber} from './check.mts';
 import {aotError} from './diagnostics.mts';
 import {
   evalStaticOrThrow,
@@ -25,7 +26,6 @@ import {
   foldScope,
   evalStaticOr,
 } from './static-eval.mts';
-import {cConstant, floatLit} from './c-syntax.mts';
 import {INT_MAX, lowerExpr} from './expressions.mts';
 import {NO_WIDE, isFn} from './collect.mts';
 import {lowerStmts} from './handlers.mts';
@@ -192,7 +192,7 @@ export function collectAnims(
           }
           throw e;
         }
-        floatLit(initVal); // a value C cannot write fails here, at the hook
+        checkNumber(initVal);
         anims.set(decl.id.name, {
           cVar: `s_av_${prefix}${decl.id.name}`,
           initial: initVal,
@@ -283,7 +283,9 @@ export function collectRefs(
           : wide.has(cVar)
             ? 'i64'
             : 'int';
-        cConstant(value, cType); // a value C cannot write fails here, at the hook
+        if (cType === 'float') {
+          checkNumber(value);
+        }
         refs.set(decl.id.name, {
           cVar,
           cType,
@@ -427,11 +429,7 @@ export function parseInterp(
       'AOT: .interpolate() inputRange and outputRange must be the same length (>= 2)',
     );
   }
-  if (input.length > 8) {
-    throw aotError(
-      'AOT: .interpolate() supports up to 8 breakpoints (ER_INTERPOLATE_MAX_POINTS)',
-    );
-  }
+  check({kind: 'interpolationPoints', count: input.length});
 
   // Convert RN extrapolation strings to engine enum names, defaulting to extend like React Native.
   const ex = (node: t.Node | undefined): string => {
@@ -484,7 +482,7 @@ function animConfigGetter(cfgObj: t.Node | null | undefined): ConfigGetter {
  * @returns The number.
  */
 function configFloat(rawValue: unknown): number {
-  floatLit(rawValue);
+  checkNumber(rawValue);
   return Number(rawValue);
 }
 
