@@ -21,6 +21,8 @@
 import type * as t from '@babel/types';
 import type {Out} from './out.mts';
 import type {IrPropValue, IrShow} from './ir/nodes.mts';
+import type {IrPanResponder} from './ir/pan-responder.mts';
+import type {IrStaticDecl} from './ir/functions.mts';
 
 /*----------------------------------------------------------------------------------------------------------------------
  - Interfaces
@@ -83,7 +85,8 @@ export interface ScalarState extends StateSlot {
   isBool: boolean;
   /** How C reads it: `s_state.<cField>`. */
   cMember: string;
-  initCode: string;
+  /** Its initial value: a string for a string slot, a number otherwise. */
+  initial: number | string;
   /** Fed by the host through a generated er_app_set_<name>() (useHostValue). */
   host: boolean;
 }
@@ -112,7 +115,7 @@ export interface ValueRef {
   kind: 'value';
   cVar: string;
   cType: 'int' | 'float' | 'i64';
-  initCode: string;
+  initial: number;
   /** Whether the generated C reads or writes it; an unused ref declares nothing. */
   used: boolean;
 }
@@ -122,7 +125,6 @@ export interface NodeRef {
   kind: 'node';
   cVar: string;
   cType: 'ERNode*';
-  initCode: 'NULL';
   used: boolean;
 }
 
@@ -131,7 +133,7 @@ export type RefRecord = ValueRef | NodeRef;
 /** A useAnimatedValue: an engine-side ERAnimValueHandle. */
 export interface AnimRecord {
   cVar: string;
-  initCode: string;
+  initial: number;
 }
 
 /** The fixed-buffer caps, resolved per compile (see resolveOptions). */
@@ -233,8 +235,8 @@ export interface PanResponderRecord {
   queries: Map<string, PanCallback>;
   /** Callbacks, by engine event. */
   events: Map<string, PanCallback>;
-  /** The C functions already generated for it, so a second node reuses them: [query or event, function]. */
-  emitted: {events: [string, string][]; queries: [string, string][]} | null;
+  /** The responder once lowered, so a second node that spreads it reuses it. */
+  lowered: IrPanResponder | null;
   /** It was created in a useRef, so the JSX spreads `<name>.current.panHandlers`. */
   viaRefCurrent?: boolean;
 }
@@ -330,7 +332,7 @@ export interface StatementContext {
   depDriven?: boolean;
   /** The body's locals become file-scope slots named `<prefix><name>`, declared into `decls`: its cleanup
    *  closure outlives the call. */
-  hoist?: {prefix: string; decls: string[]};
+  hoist?: {prefix: string; decls: IrStaticDecl[]};
   /** Compiles a dep-driven effect's `return () => …` into its companion cleanup function; `armed` is the flag
    *  that says the last run reached it. */
   cleanup?: {armed: string; emit: (fn: FunctionNode, env: Env) => void};

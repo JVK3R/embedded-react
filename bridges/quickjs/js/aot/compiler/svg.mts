@@ -33,12 +33,8 @@ import {evalStatic, withUndefined} from './static-eval.mts';
 import {floatLit} from './c-syntax.mts';
 import {lowerExpr} from './expressions.mts';
 import {lowerColorValue, collectStyleAssigns} from './style-text.mts';
-import {emitIrNode, lowerRefBinds} from './nodes.mts';
-import {
-  printStateDrivenVector,
-  printTapeValue,
-  printVectorTables,
-} from './c/vectors.mts';
+import {lowerRefBinds} from './nodes.mts';
+import {MAX_GRADIENT_STOPS, printTapeValue} from './c/vectors.mts';
 import type * as t from '@babel/types';
 import type {Out} from './out.mts';
 import type {IrNode} from './ir/nodes.mts';
@@ -54,13 +50,7 @@ import type {
   IrVectorPaint,
   IrVectorTables,
 } from './ir/vectors.mts';
-import type {
-  EmitOptions,
-  Env,
-  Scope,
-  StateTable,
-  VectorGradient,
-} from './types.mts';
+import type {EmitOptions, Env, Scope, StateTable} from './types.mts';
 
 /*----------------------------------------------------------------------------------------------------------------------
  - Interfaces
@@ -228,6 +218,41 @@ export const vectorPaintOf = (record: number[]): IrVectorPaint => ({
   fillGradient: (record[7] || 0) | 0,
   strokeGradient: (record[8] || 0) | 0,
 });
+
+/**
+ * Refuses a paint whose widths C cannot write, where the paint is lowered rather than when its table is.
+ *
+ * @param paints  The paints, in table order.
+ */
+export function checkVectorPaints(paints: IrVectorPaint[]): void {
+  for (const paint of paints) {
+    floatLit(paint.strokeWidth);
+    floatLit(paint.miter);
+  }
+}
+
+/**
+ * Refuses baked tables holding a number C cannot write, in the order the tables are written: the ops, the
+ * paints, then each gradient's kept stops, and geometry. An empty tape has no tables to check.
+ *
+ * @param tables  The drawing.
+ */
+function checkVectorTables(tables: IrVectorTables): void {
+  if (!tables.ops.length) return;
+  for (const op of tables.ops) {
+    floatLit(op);
+  }
+  checkVectorPaints(tables.paints);
+  for (const gradient of tables.gradients) {
+    for (const stop of (gradient.stops || []).slice(0, MAX_GRADIENT_STOPS)) {
+      floatLit(stop.offset);
+    }
+    const {ax, ay, bx, by, r} = gradient;
+    for (const field of [ax, ay, bx, by, r]) {
+      floatLit(field || 0);
+    }
+  }
+}
 
 /**
  * A drawing's flat paint records as paints, one per shape.
@@ -1165,7 +1190,8 @@ function emitSvgStatic(
     paints: paintsOf(paints),
     gradients: [],
   };
-  out.vectorData.push(...printVectorTables(tables));
+  checkVectorTables(tables);
+  out.vectors.push({kind: 'tables', tables});
 
   // Create the vector node and point it at the tables.
   const node = lowerSvgBox(
@@ -1178,7 +1204,6 @@ function emitSvgStatic(
     env,
   );
   node.wiring.push({kind: 'vectorTables', tables});
-  emitIrNode(node, out);
   return node;
 }
 
@@ -1273,7 +1298,6 @@ function emitSvgSource(
       env,
     );
     node.image = {kind: 'static', name: artifact.name, resetOnUpdate: false};
-    emitIrNode(node, out);
     return node;
   }
 
@@ -1286,7 +1310,8 @@ function emitSvgSource(
     paints: paintsOf(scaled.paints),
     gradients: scaled.gradients || [],
   };
-  out.vectorData.push(...printVectorTables(tables));
+  checkVectorTables(tables);
+  out.vectors.push({kind: 'tables', tables});
 
   // Create the vector node and point it at the tables.
   const node = lowerSvgBox(
@@ -1299,7 +1324,6 @@ function emitSvgSource(
     env,
   );
   node.wiring.push({kind: 'vectorTables', tables});
-  emitIrNode(node, out);
   return node;
 }
 
@@ -1382,10 +1406,8 @@ function emitSvgDynamic(
     gradients,
   };
 
-  // Declare the tables and emit build_svgN(), which rewrites the tape (and anything in the paints state drives).
-  const printed = printStateDrivenVector(vector);
-  out.vectorData.push(...printed.data);
-  out.vectorBuilders.push(printed.builder);
+  // Declare the tables and build_svgN(), which rewrites the tape (and anything in the paints state drives).
+  out.vectors.push({kind: 'drawing', vector});
 
   // Create the vector node, build its tape once, and register it for app_update() to rebuild.
   const node = lowerSvgBox(
@@ -1398,15 +1420,6 @@ function emitSvgDynamic(
     env,
   );
   node.wiring.push({kind: 'stateDrivenVector', vector});
-  emitIrNode(node, out);
-  out.handles.push(nodeId);
-  out.svgUpdates.push({
-    id: svgId,
-    len: tape.length,
-    nPaints: vector.paints.length,
-    nGrads: gradients.length,
-    nodeVar: `s_${nodeId}`,
-  });
 
   return node;
 }

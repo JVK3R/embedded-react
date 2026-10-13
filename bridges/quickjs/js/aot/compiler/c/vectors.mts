@@ -28,6 +28,7 @@ import type {
   IrPaintColor,
   IrStateDrivenVector,
   IrTapeValue,
+  IrVectorData,
   IrVectorPaint,
   IrVectorTables,
 } from '../ir/vectors.mts';
@@ -39,7 +40,7 @@ import type {VectorGradient} from '../types.mts';
  ---------------------------------------------------------------------------------------------------------------------*/
 
 /** The most color stops the engine's ERVectorGradient holds; more are dropped. */
-const MAX_GRADIENT_STOPS = 8;
+export const MAX_GRADIENT_STOPS = 8;
 
 /*----------------------------------------------------------------------------------------------------------------------
  - Implementation
@@ -434,4 +435,56 @@ export function printUpdateVector(update: IrUpdateVector): string[] {
   }
 
   return lines;
+}
+
+/**
+ * Every drawing's file-scope C, in the order the app declares them: the table declarations, and apart from
+ * them the builders of the state-driven drawings (app_update() calls those, so they go ahead of it).
+ *
+ * @param vectors  The drawings.
+ *
+ * @returns The declarations and the builders, each a block of C.
+ */
+export function printVectorBlocks(vectors: IrVectorData[]): {
+  data: string;
+  builders: string;
+} {
+  const data: string[] = [];
+  const builders: string[] = [];
+  for (const vector of vectors) {
+    if (vector.kind === 'tables') {
+      data.push(...printVectorTables(vector.tables));
+    } else if (vector.kind === 'drawing') {
+      const printed = printStateDrivenVector(vector.vector);
+      data.push(...printed.data);
+      builders.push(printed.builder);
+    } else {
+      data.push(...printUpdateVectorData(vector.update));
+    }
+  }
+
+  return {data: data.join('\n\n'), builders: builders.join('\n\n')};
+}
+
+/**
+ * A state-driven drawing's app_update() entry: its tape rebuilt from state, then handed to its node again.
+ *
+ * @param nodeId  The node's variable; its handle is `s_<nodeId>`.
+ * @param vector  The drawing.
+ *
+ * @returns The C lines.
+ */
+export function printVectorRebuild(
+  nodeId: string,
+  vector: IrStateDrivenVector,
+): string[] {
+  const {id} = vector;
+  const gradientCount = vector.gradients.length;
+  return [
+    `    build_svg${id}();`,
+    `    er_node_set_vector_ops(s_${nodeId}, s_svg${id}_ops, ` +
+      `${vector.tape.length}, s_svg${id}_paints, ${vector.paints.length}, ` +
+      `${gradientCount ? `s_svg${id}_grads` : 'NULL'}, ` +
+      `${gradientCount});`,
+  ];
 }

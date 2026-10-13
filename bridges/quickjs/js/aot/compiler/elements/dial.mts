@@ -31,9 +31,9 @@ import {
   styleWrites,
   collectStyleAssigns,
 } from '../style-text.mts';
-import {compileValueHandler} from '../handlers.mts';
+import {lowerValueHandler} from '../handlers.mts';
 import {emitChildren} from '../control-flow.mts';
-import {emitIrNode, lowerRefBinds} from '../nodes.mts';
+import {checkInterpolations, lowerRefBinds} from '../nodes.mts';
 import {imageNameFromSource} from './image.mts';
 import type * as t from '@babel/types';
 import type {Out} from '../out.mts';
@@ -397,7 +397,7 @@ export function emitDial(
       onChangeFn = env.callbacks.get(onChangeFn.name);
     }
 
-    // Require a function node so compileValueHandler can bind the dial's value parameters.
+    // Require a function node so lowerValueHandler can bind the dial's value parameters.
     if (!isFn(onChangeFn)) {
       throw aotError(
         'AOT: <Dial onChange> must be an inline function or a useCallback',
@@ -407,8 +407,9 @@ export function emitDial(
 
     const handlerName = `er_handler_${out.handlers.length}`;
     out.handlers.push({
+      kind: 'callback',
       name: handlerName,
-      body: compileValueHandler(
+      callback: lowerValueHandler(
         onChangeFn,
         'data->value',
         env,
@@ -429,14 +430,7 @@ export function emitDial(
     node.wiring.push({kind: 'ref', slot});
   }
 
-  emitIrNode(node, out);
-  node.children = emitChildren(
-    element.children,
-    nodeID,
-    scope,
-    out,
-    env,
-    state,
-  );
+  checkInterpolations(node);
+  node.children = emitChildren(element.children, scope, out, env, state);
   return node;
 }

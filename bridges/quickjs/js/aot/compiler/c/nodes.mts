@@ -20,16 +20,32 @@
 
 import {cstr, floatLit} from '../c-syntax.mts';
 import {printCondition, printExpr} from './expressions.mts';
+import {panEventName, panQueryName} from './pan-responder.mts';
 import {printText} from './text.mts';
 import {printStateDrivenVectorWiring, printVectorOps} from './vectors.mts';
+import {isStateDriven} from '../ir/nodes.mts';
 import type {IrElement, IrNode, IrPropValue, IrShow} from '../ir/nodes.mts';
+import type {IrPanResponder} from '../ir/pan-responder.mts';
 import type {AnimBind} from '../style-text.mts';
-import type {NodeUpdate} from '../out.mts';
-import type {PanResponderRecord} from '../types.mts';
+import type {DynAssign, FormatResult, StaticAssign} from '../types.mts';
 
 /*----------------------------------------------------------------------------------------------------------------------
  - Interfaces
  ---------------------------------------------------------------------------------------------------------------------*/
+
+/** A node whose props depend on state: app_update() rebuilds its ERProps and re-applies them. */
+export interface NodeUpdate {
+  /** The node's variable (`n<id>`); its handle is the file-scope `s_n<id>`. */
+  nodeId: string;
+  styleAssigns: StaticAssign[];
+  dynAssigns: DynAssign[];
+  /** A dynamic text body, as one printf format and its arguments. */
+  text: FormatResult | null;
+  /** A C expression naming the image to show when the source is dynamic. */
+  imageName: string | null;
+  /** A static TextInput placeholder. */
+  placeholder: string | null;
+}
 
 /** A node as C: the lines er_app_build() runs, and the app_update() entry of a node state drives. */
 export interface PrintedNode {
@@ -138,25 +154,22 @@ function printBind(node: IrNode, bind: AnimBind, index: number): string[] {
 }
 
 /**
- * Wires a PanResponder's already-emitted handlers and queries onto a node.
+ * Wires a PanResponder's handlers and queries onto a node.
  *
  * @param pan  The responder.
  * @param nodeId  The node's variable.
  *
  * @returns The C lines.
  */
-export function printPanWiring(
-  pan: PanResponderRecord,
-  nodeId: string,
-): string[] {
+export function printPanWiring(pan: IrPanResponder, nodeId: string): string[] {
   return [
-    ...pan.emitted!.events.map(
-      ([event, handler]) =>
-        `    er_event_set(${nodeId}, ${event}, ${handler}, NULL);`,
+    ...pan.events.map(
+      event =>
+        `    er_event_set(${nodeId}, ${event.event}, ${panEventName(pan, event)}, NULL);`,
     ),
-    ...pan.emitted!.queries.map(
-      ([query, fn]) =>
-        `    er_responder_query_set(${nodeId}, ${query}, ${fn}, NULL);`,
+    ...pan.queries.map(
+      query =>
+        `    er_responder_query_set(${nodeId}, ${query.query}, ${panQueryName(pan, query)}, NULL);`,
     ),
   ];
 }
@@ -178,14 +191,9 @@ export function printNode(node: IrNode): PrintedNode {
       : node.image?.resetOnUpdate
         ? cstr(node.image.name)
         : null;
-  const isDynamic =
-    (text?.args.length ?? 0) > 0 ||
-    node.stateProps.length > 0 ||
-    node.image?.kind === 'value';
-
   const build = [`    ${id} = er_node_create(${node.type});`];
   let update: NodeUpdate | null = null;
-  if (isDynamic) {
+  if (isStateDriven(node)) {
     build.push(`    s_${id} = ${id};`);
     update = {
       nodeId: id,
@@ -277,3 +285,76 @@ export function printNode(node: IrNode): PrintedNode {
  */
 export const printAppend = (parentId: string, child: IrElement): string =>
   `    er_tree_append_child(${parentId}, ${child.id});`;
+
+/**
+ * An element and everything under it as er_app_build() lines: each node, then each child's subtree followed by
+ * the line that appends it.
+ *
+ * @param element  The element.
+ *
+ * @returns The C lines.
+ */
+export function printElementTree(element: IrElement): string[] {
+  if (element.kind === 'component') {
+    return printElementTree(element.root);
+  }
+
+  const lines = printNode(element.node).build;
+  const appendChild = (child: IrElement | null): void => {
+    if (child) {
+      lines.push(...printElementTree(child), printAppend(element.id, child));
+    }
+  };
+  for (const child of element.node.children) {
+    if (child.kind === 'element') {
+      appendChild(child.element);
+    } else if (child.kind === 'conditional') {
+      appendChild(child.whenTrue);
+      appendChild(child.whenFalse);
+    } else {
+      child.rows.forEach(appendChild);
+    }
+  }
+
+  return lines;
+}
+
+/**
+ * A state-driven node's app_update() entry: its props built again, then set.
+ *
+ * @param update  The node's entry.
+ *
+ * @returns The C lines.
+ */
+export function printNodeUpdate(update: NodeUpdate): string[] {
+  const lines = [`    er_props_default(&p);`];
+  for (const assign of update.styleAssigns) {
+    lines.push(`    p.${assign.field} = ${assign.expr};`);
+  }
+  for (const assign of update.dynAssigns) {
+    lines.push(`    p.${assign.field} = ${printPropValue(assign.value)};`);
+  }
+  if (update.placeholder != null) {
+    lines.push(
+      `    snprintf(p.placeholder, sizeof(p.placeholder), "%s", ${cstr(update.placeholder)});`,
+    );
+  }
+  if (update.imageName != null) {
+    lines.push(
+      `    snprintf(p.image_name, sizeof(p.image_name), "%s", ${update.imageName});`,
+    );
+  }
+  if (update.text) {
+    if (update.text.args.length) {
+      lines.push(
+        `    snprintf(p.text, sizeof(p.text), ${cstr(update.text.format)}, ${update.text.args.join(', ')});`,
+      );
+    } else {
+      lines.push(
+        `    snprintf(p.text, sizeof(p.text), "%s", ${cstr(update.text.format.replace(/%%/g, '%'))});`,
+      );
+    }
+  }
+  lines.push(`    er_node_set_props(s_${update.nodeId}, &p);`);
+  return lines;
+}

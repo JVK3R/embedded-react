@@ -19,46 +19,37 @@
  ---------------------------------------------------------------------------------------------------------------------*/
 
 import {readFileSync} from 'node:fs';
-import {aotError} from './diagnostics.mts';
-import {evalStatic, withUndefined} from './static-eval.mts';
-import {cScalarType, stripCLiterals, floatLit, cstr} from './c-syntax.mts';
 import {
-  CHECKED_OP,
-  findShadowedClockCalls,
-  emitExprWide,
-} from './expressions.mts';
-import {
-  findComponent,
-  declaredNames,
-  moduleScope,
-  collectState,
-  findReturnJSX,
-  collectComponents,
-  collectHelpers,
-  collectImageImports,
-  collectSvgImports,
-  collectCallbacks,
-  collectMemos,
-  collectEffects,
-} from './collect.mts';
-import {collectAnims, collectRefs} from './animations.mts';
-import {APP_UPDATE_CALL, compileEffect} from './handlers.mts';
-import {collectPanResponders} from './pan-responder.mts';
-import {emitNode} from './nodes.mts';
-import {compileKeyboardConfig} from './keyboard.mts';
-import {normalizeUndefined, parseApp} from './parse.mts';
-import {Out} from './out.mts';
+  cConstant,
+  cScalarType,
+  stripCLiterals,
+  floatLit,
+  cstr,
+} from './c-syntax.mts';
+import {CHECKED_OP} from './expressions.mts';
+import {lowerApp} from './lower.mts';
 import {printWaitDeclarations} from './c/animations.mts';
-import {printPropValue} from './c/nodes.mts';
-import type {BlockStatement} from '@babel/types';
+import {
+  printAnimationCallback,
+  printDepEffectCheck,
+  printEffectFunction,
+  printHandler,
+  printMountEffect,
+  printStaticDecl,
+  printTimerFunction,
+} from './c/functions.mts';
+import {printKeyboard} from './c/keyboard.mts';
+import {printElementTree, printNode, printNodeUpdate} from './c/nodes.mts';
+import {printPanDecls, printPanQuery} from './c/pan-responder.mts';
+import {printVectorBlocks, printVectorRebuild} from './c/vectors.mts';
+import {isStateDriven, nodesOf, stateDrivenVectorOf} from './ir/nodes.mts';
 import type {ResolvedOptions} from './options.mts';
+import type {IrApp} from './ir/app.mts';
 import type {
   AssetImport,
-  Env,
   ItemField,
   ItemStruct,
   ScalarState,
-  Scope,
 } from './types.mts';
 
 /*----------------------------------------------------------------------------------------------------------------------
@@ -113,9 +104,9 @@ export const demoMarker = (demo: string): string =>
   `ER_AOT_DEMO_${demo.replace(/[^A-Za-z0-9]/gu, character => `_${character.codePointAt(0)!.toString(16)}_`)}`;
 
 /**
- * Compiles a Flow B app's JSX (or TSX) source to C: runs the compiler passes over the parsed app and stitches
- * their output into app.gen.c and app.gen.h. Pure (no I/O), so it can be unit-tested directly; compileSource
- * (compile.mts) is the public entry around it.
+ * Compiles a Flow B app's JSX (or TSX) source to C: lowers it (lowerApp) and writes the result as app.gen.c
+ * and app.gen.h. Pure (no I/O), so it can be unit-tested directly; compileSource (compile.mts) is the public
+ * entry around it.
  *
  * @param src  The App.jsx/App.tsx source text.
  * @param demo  Demo name (only used in the generated-by header comment).
@@ -125,136 +116,30 @@ export const demoMarker = (demo: string): string =>
  *
  * @returns The generated app.gen.c and app.gen.h, and what they contain.
  */
-export function compileSourceImpl(
+export const compileSourceImpl = (
   src: string,
   demo: string,
   opts: ResolvedOptions,
   wide: Set<string>,
   found: Set<string>,
+): CompileResult => writeApp(lowerApp(src, opts, wide, found), demo, opts);
+
+/**
+ * Writes a lowered app as C: file-scope state, declarations and functions, then er_app_build(), in
+ * app.gen.c, and the app's public entry points in app.gen.h.
+ *
+ * @param app  The lowered app.
+ * @param demo  Demo name (only used in the generated-by header comment).
+ * @param opts  compileSource's options, resolved (see resolveOptions).
+ *
+ * @returns The generated app.gen.c and app.gen.h, and what they contain.
+ */
+export function writeApp(
+  app: IrApp,
+  demo: string,
+  opts: ResolvedOptions,
 ): CompileResult {
-  // Parse the app and prepare the AST for the passes below.
-  const ast = parseApp(src, opts);
-  normalizeUndefined(ast);
-  const shadowedClock = findShadowedClockCalls(ast);
-
-  // Seed the module scope with image imports (each is its baked-name string) so consts that use them can fold.
-  const {screen} = opts;
-  const imageImports = collectImageImports(ast.program);
-  const svgImports = collectSvgImports(ast.program);
-  const imageSeed = Object.fromEntries(
-    [...imageImports].map(([local, imageImport]) => [local, imageImport.name]),
-  );
-  const scope: Scope = moduleScope(ast.program, screen, imageSeed);
-  // Snapshot module bindings before App's consts fold in: child components close over these, not App's shadows.
-  const moduleConsts: Scope = {...scope};
-  const component = findComponent(ast.program);
-  // Hide redeclared module names, then fold the body's static consts so responsive `if`s resolve at compile time.
-  for (const name of declaredNames((component.body as BlockStatement).body)) {
-    delete scope[name];
-  }
-
-  for (const statement of (component.body as BlockStatement).body) {
-    if (
-      statement.type !== 'VariableDeclaration' ||
-      statement.kind !== 'const'
-    ) {
-      continue;
-    }
-
-    for (const decl of statement.declarations) {
-      if (decl.id.type !== 'Identifier' || !decl.init) continue;
-      try {
-        scope[decl.id.name] = evalStatic(decl.init, withUndefined(scope));
-      } catch {
-        // A dynamic const must hide a same-named module const, or the JSX quietly renders the module value.
-        delete scope[decl.id.name];
-      }
-    }
-  }
-
-  // Collect the component's state; a state name hides any module const of the same name from the folds.
-  const state = collectState(
-    component.body as BlockStatement,
-    scope,
-    opts.caps,
-    '',
-    wide,
-  );
-  for (const name of state.byName.keys()) {
-    delete scope[name];
-  }
-
-  // Collect the component's other hooks, plus the file's helpers and child components.
-  const rootJSX = findReturnJSX(component.body as BlockStatement, scope);
-  const anims = collectAnims(component.body, scope);
-  const refs = collectRefs(component.body, scope, '', wide);
-  for (const name of [...anims.keys(), ...refs.keys()]) {
-    delete scope[name];
-  }
-
-  const pans = collectPanResponders(component.body);
-  const callbacks = collectCallbacks(component.body);
-  const memos = collectMemos(component.body);
-  const helpers = collectHelpers(component.body, ast.program);
-  const components = collectComponents(ast.program);
-  const imageNames = new Map(
-    [...imageImports].map(([, imageImport]) => [
-      imageImport.name,
-      imageImport.importPath,
-    ]),
-  ); // asset name → path
-
-  // The expression environment every emitter compiles against.
-  const env: Env = {
-    state: state.byName,
-    locals: new Map(),
-    consts: scope,
-    moduleConsts, // what an inlined child component sees (see emitComponent)
-    animations: anims,
-    refs,
-    pans,
-    callbacks,
-    helpers,
-    imageNames,
-    svgImports,
-    svgArtifacts: opts.svgArtifacts || {},
-    caps: opts.caps,
-    wide,
-    found,
-    shadowedClock,
-  };
-
-  // Before emit, fold each memo or inline its C expression at each use (no cache needed: dep tracking re-applies).
-  for (const [name, expr] of memos) {
-    try {
-      scope[name] = evalStatic(expr, scope);
-    } catch {
-      const cExpr = emitExprWide(expr, env);
-      env.locals.set(name, {
-        code: `(${cExpr.code})`,
-        cType: cExpr.cType,
-        isBool: cExpr.isBool,
-      });
-      delete scope[name]; // a runtime binding beats a module const of its name in every fold
-    }
-  }
-
-  // Emit the scene graph from the root JSX; `out` collects every generated fragment.
-  const out = new Out(components, ast.program);
-  compileKeyboardConfig(ast.program, out); // module-level setKeyboardConfig({...}) → static ERKeyboardConfig
-  const rootNodeId = emitNode(rootJSX, scope, out, env, state).id;
-
-  // Emit registered only the images it reached; a dynamic source can't be enumerated, so bake every import.
-  if (out.bakeAllImages) {
-    for (const [, imageImport] of imageImports) {
-      out.images.set(imageImport.name, imageImport.importPath);
-    }
-  }
-
-  // Compile effects (mount-once or dep-driven) after emit, so out.timerFns/usesTimers include handler timers too.
-  for (const effect of collectEffects(component.body)) {
-    compileEffect(effect, env, state, out);
-  }
+  const {out} = app;
 
   // One ERNode* local in er_app_build() per node the tree allocated.
   const nodeDecls = Array.from(
@@ -263,7 +148,7 @@ export function compileSourceImpl(
   );
 
   // App state + every inlined child instance's per-instance state (each already namespaced via cField).
-  const stateRecords = [...state.byName.values(), ...out.childStateRecords];
+  const stateRecords = app.state;
   const scalarRecords = stateRecords.filter(
     stateRecord => stateRecord.kind === 'scalar',
   );
@@ -302,147 +187,93 @@ export function compileSourceImpl(
   const scalarBlock = scalarRecords.length
     ? `typedef struct\n{\n${scalarRecords.map(scalarFieldDecl).join('\n')}\n} ` +
       `ErAppState;\n\nstatic ErAppState s_state = ` +
-      `{${scalarRecords.map(scalarRecord => ` .${scalarRecord.cField} = ${scalarRecord.initCode}`).join(',')} ` +
+      `{${scalarRecords.map(scalarRecord => ` .${scalarRecord.cField} = ${cConstant(scalarRecord.initial, scalarRecord.cType)}`).join(',')} ` +
       `};\n`
     : '';
   const stateBlock = [scalarBlock, listBlocks].filter(Boolean).join('\n');
 
-  // A file-scope handle for each node app_update() re-applies.
-  const handleDecls = out.handles
+  // The nodes er_app_build() creates, each before its children, and what app_update() re-applies to them.
+  const nodes = nodesOf(app.root);
+  const buildLines = printElementTree(app.root).join('\n');
+  const updates = nodes.flatMap(node => printNode(node).update ?? []);
+
+  // A file-scope handle for each node app_update() re-applies, and one for each drawing it rebuilds.
+  const handleDecls = nodes
+    .flatMap(node => [
+      ...(isStateDriven(node) ? [node.id] : []),
+      ...(stateDrivenVectorOf(node) ? [node.id] : []),
+    ])
     .map(nodeId => `static ERNode* s_${nodeId};`)
     .join('\n');
 
   // Static per-value ref, skipping refs the C never touches, so consumer builds don't warn about unused statics.
-  const refDecls = [...refs.values(), ...out.childRefs]
+  const refDecls = app.refs
     .filter(refRecord => refRecord.used)
     .map(
       refRecord =>
         `static ` +
         `${refRecord.kind === 'value' ? cScalarType(refRecord.cType) : refRecord.cType} ` +
-        `${refRecord.cVar} = ${refRecord.initCode};`,
+        `${refRecord.cVar} = ${refRecord.kind === 'value' ? cConstant(refRecord.initial, refRecord.cType) : 'NULL'};`,
     )
     .join('\n');
 
-  // Baked vector op-tapes + paint tables (static <Svg> geometry), emitted at file scope.
-  const vectorBlock = out.vectorData.join('\n\n');
-  // build_svgN() recompute functions (state-driven Svgs) — declared before app_update, which calls them.
-  const vectorBuilderBlock = out.vectorBuilders.join('\n\n');
+  // Vector op-tapes + paint tables, and the build_svgN() functions declared before app_update, which calls them.
+  const {data: vectorBlock, builders: vectorBuilderBlock} = printVectorBlocks(
+    out.vectors,
+  );
 
   // Animated values — one engine-side handle each, created at the top of er_app_build (binds reference them).
-  const animList = [...anims.values(), ...out.childAnimations];
+  const animList = app.animations;
   const animDecls = animList
     .map(animValue => `static ERAnimValueHandle ${animValue.cVar};`)
     .join('\n');
   const animCreate = animList
     .map(
       animValue =>
-        `    ${animValue.cVar} = er_anim_value_create(${animValue.initCode});`,
+        `    ${animValue.cVar} = er_anim_value_create(${floatLit(animValue.initial)});`,
     )
     .join('\n');
 
-  // app_update() exists only when something has to be re-applied after a state change.
-  const hasUpdate =
-    out.updates.length > 0 ||
-    out.svgUpdates.length > 0 ||
-    out.depEffects.length > 0;
-  // With nothing to re-apply, there is no app_update, so the calls queued by setters go too.
-  if (!hasUpdate) {
-    const dropUpdate = (lines: string[]) =>
-      lines.filter(line => line !== APP_UPDATE_CALL);
-    for (const cFunction of [
-      ...out.handlers,
-      ...out.timerFns,
-      ...out.animCbs,
-      ...out.effectFns,
-    ]) {
-      cFunction.body = dropUpdate(cFunction.body!);
-    }
-    out.mountEffects = dropUpdate(out.mountEffects);
-  }
-
-  // A composition that no start waits on has no waits for a stop to end, so its stop calls go.
-  const idleWaitStops = [...out.animWaits.values()]
-    .filter(record => !record.isStarted)
-    .flatMap(record => [
-      `app_wait_detach(${record.owner});`,
-      `app_wait_report(${record.owner});`,
-    ]);
+  // The app's functions, and what er_app_build() runs last, as C.
+  const {hasUpdate} = app;
   const usesWaits = [...out.animWaits.values()].some(
     record => record.isStarted,
   );
-  if (idleWaitStops.length) {
-    const dropIdleStops = (lines: string[]) =>
-      lines.filter(line => !idleWaitStops.includes(line.trim()));
-    for (const cFunction of [
-      ...out.handlers,
-      ...out.timerFns,
-      ...out.animCbs,
-      ...out.effectFns,
-    ]) {
-      cFunction.body = dropIdleStops(cFunction.body!);
-    }
-    out.mountEffects = dropIdleStops(out.mountEffects);
-  }
+  const handlers = out.handlers.map(printHandler);
+  const timerFns = out.timerFns.map(printTimerFunction);
+  const animCbs = out.animCbs.flatMap(printAnimationCallback);
+  const effectFns = out.effectFns.map(printEffectFunction);
+  const mountEffects = out.mountEffects.flatMap(printMountEffect).join('\n');
 
   // app_update(): re-apply state-driven node props, rebuild state-driven Svgs, then run dep-driven effects.
   const updateBlock = (() => {
     if (!hasUpdate) return '';
     const lines = ['static void app_update(void)', '{'];
-    if (out.updates.length) {
+    if (updates.length) {
       lines.push('    ERProps p;');
     }
-    for (const update of out.updates) {
-      lines.push(`    er_props_default(&p);`);
-      for (const assign of update.styleAssigns) {
-        lines.push(`    p.${assign.field} = ${assign.expr};`);
-      }
-      for (const assign of update.dynAssigns) {
-        lines.push(`    p.${assign.field} = ${printPropValue(assign.value)};`);
-      }
-      if (update.placeholder != null) {
-        lines.push(
-          `    snprintf(p.placeholder, sizeof(p.placeholder), "%s", ${cstr(update.placeholder)});`,
-        );
-      }
-      if (update.imageName != null) {
-        lines.push(
-          `    snprintf(p.image_name, sizeof(p.image_name), "%s", ${update.imageName});`,
-        );
-      }
-      if (update.text) {
-        if (update.text.args.length) {
-          lines.push(
-            `    snprintf(p.text, sizeof(p.text), ${cstr(update.text.format)}, ${update.text.args.join(', ')});`,
-          );
-        } else {
-          lines.push(
-            `    snprintf(p.text, sizeof(p.text), "%s", ${cstr(update.text.format.replace(/%%/g, '%'))});`,
-          );
-        }
-      }
-      lines.push(`    er_node_set_props(s_${update.nodeId}, &p);`);
+    for (const update of updates) {
+      lines.push(...printNodeUpdate(update));
     }
     // State-driven Svgs: recompute the op-tape from state and re-upload.
-    for (const svgUpdate of out.svgUpdates) {
-      lines.push(`    build_svg${svgUpdate.id}();`);
-      lines.push(
-        `    er_node_set_vector_ops(${svgUpdate.nodeVar}, s_svg${svgUpdate.id}_ops, ` +
-          `${svgUpdate.len}, s_svg${svgUpdate.id}_paints, ${svgUpdate.nPaints}, ` +
-          `${svgUpdate.nGrads ? `s_svg${svgUpdate.id}_grads` : 'NULL'}, ` +
-          `${svgUpdate.nGrads || 0});`,
-      );
+    for (const node of nodes) {
+      const vector = stateDrivenVectorOf(node);
+      if (vector) {
+        lines.push(...printVectorRebuild(node.id, vector));
+      }
     }
     // Dep-driven useEffect: run each effect whose dependency value changed since the last app_update.
-    for (const block of out.depEffects) {
-      lines.push(block);
+    for (const effect of out.depEffects) {
+      lines.push(printDepEffectCheck(effect));
     }
     lines.push('}');
     return lines.join('\n');
   })();
 
   // PanResponder gesture state, plus should-set predicates: bool callbacks the engine calls during negotiation.
-  const panDeclBlock = out.panDecls.join('\n');
-  const queryDefs = out.queries
+  const panDeclBlock = out.panResponders.flatMap(printPanDecls).join('\n');
+  const queryDefs = out.panResponders
+    .flatMap(pan => pan.queries.map(query => printPanQuery(pan, query)))
     .map(
       query =>
         `static bool ${query.name}(ERNode* node, const EREventData* data, void* ` +
@@ -452,7 +283,7 @@ export function compileSourceImpl(
     .join('\n\n');
 
   // Event handlers, each with the engine's event callback signature.
-  const handlerDefs = out.handlers
+  const handlerDefs = handlers
     .map(
       handler =>
         `static void ${handler.name}(ERNode* node, const EREventData* data, void* ` +
@@ -462,11 +293,13 @@ export function compileSourceImpl(
     .join('\n\n');
 
   // Dep-driven effects: a previous-value static per dep, the bodies, and forward decls (app_update comes first).
-  const effectDeclsBlock = out.effectDecls.join('\n');
-  const effectFwdDecls = out.effectFns
+  const effectDeclsBlock = out.effectDecls
+    .flatMap(decl => printStaticDecl(decl, opts.caps.listStrCap))
+    .join('\n');
+  const effectFwdDecls = effectFns
     .map(effectFn => `static void ${effectFn.name}(void);`)
     .join('\n');
-  const effectFnDefs = out.effectFns
+  const effectFnDefs = effectFns
     .map(
       effectFn =>
         `static void ${effectFn.name}(void)\n{\n${effectFn.body.join('\n')}\n}`,
@@ -513,25 +346,25 @@ static int er_timer_add(int ms, bool repeat, void (*fn)(void))
 }`
     : '';
 
-  const timerFnDefs = out.timerFns
+  const timerFnDefs = timerFns
     .map(
       timerFn =>
-        `static void ${timerFn.name}(void)\n{\n${timerFn.body!.join('\n')}\n}`,
+        `static void ${timerFn.name}(void)\n{\n${timerFn.body.join('\n')}\n}`,
     )
     .join('\n\n');
 
   // Forward-declare every timer fn: the handlers and effect fns that register one are defined before it.
-  const timerFnFwdDecls = out.timerFns
+  const timerFnFwdDecls = timerFns
     .map(timerFn => `static void ${timerFn.name}(void);`)
     .join('\n');
 
   // Animated.sequence on_complete callbacks each start the next step, so they are forward-declared.
-  const animCbDecls = out.animCbs
+  const animCbDecls = animCbs
     .map(
       animCb => `static void ${animCb.name}(bool finished, void* user_data);`,
     )
     .join('\n');
-  const animCbDefs = out.animCbs
+  const animCbDefs = animCbs
     .map(
       animCb =>
         `static void ${animCb.name}(bool finished, void* user_data)\n{\n    (void)finished;\n ` +
@@ -582,9 +415,9 @@ ${wallClockRefresh}${waitTick}    for (int i = 0; i < ER_AOT_MAX_TIMERS; i++)
     : `void er_app_tick(int dt_ms)\n{\n    (void)dt_ms;\n${wallClockRefresh}${waitTick}}`;
 
   // useEffect(fn, []) bodies, run once at the end of er_app_build().
-  const mountEffectsBlock = out.mountEffects.length
+  const mountEffectsBlock = mountEffects
     ? '\n    /* useEffect(fn, []) — run once on mount. */\n' +
-      out.mountEffects.join('\n') +
+      mountEffects +
       '\n'
     : '';
 
@@ -597,8 +430,8 @@ ${wallClockRefresh}${waitTick}    for (int i = 0; i < ER_AOT_MAX_TIMERS; i++)
       effectFnDefs,
       animCbDefs,
       timerFnDefs,
-      out.mountEffects.join('\n'),
-      out.build.join('\n'),
+      mountEffects,
+      buildLines,
     ].join('\n'),
   );
   const dimRoundBlock = usesDimRound
@@ -642,19 +475,13 @@ static int16_t app_round_dim(double v)
         queryDefs,
         animCbDefs,
         timerFnDefs,
-        out.mountEffects.join('\n'),
-        out.build.join('\n'),
+        mountEffects,
+        buildLines,
       ].join('\n'),
     );
 
   // Each useHostValue gets a public setter that writes its field and refreshes via app_update(), like a JS setter.
   const hostRecords = scalarRecords.filter(scalarRecord => scalarRecord.host);
-  if (hostRecords.some(hostRecord => hostRecord.name === 'wall_clock')) {
-    throw aotError(
-      'AOT: useHostValue("wall_clock") would collide with er_app_set_wall_clock()',
-      'rename the host value — every app exports er_app_set_wall_clock() for Date.now().',
-    );
-  }
   const hostSettersBlock = hostRecords
     .map(
       hostRecord =>
@@ -937,8 +764,8 @@ static int16_t app_round_dim(double v)
       effectFnDefs,
       animCbDefs,
       timerFnDefs,
-      out.mountEffects.join('\n'),
-      out.build.join('\n'),
+      mountEffects,
+      buildLines,
     ].join('\n'),
   );
 
@@ -991,6 +818,7 @@ static int16_t app_round_dim(double v)
   const limitsInclude = usesLimits ? '#include <limits.h>\n' : '';
   // A blank line sets off each non-empty block before and after.
   const spaced = (block: string) => (block ? '\n' + block + '\n' : '');
+  const keyboard = app.keyboard ? printKeyboard(app.keyboard) : null;
   const declarations = [
     refDecls,
     panDeclBlock,
@@ -1011,12 +839,12 @@ static int16_t app_round_dim(double v)
     effectFnDefs,
     animCbDefs,
     timerFnDefs,
-    out.kbdData,
+    keyboard?.data ?? '',
   ]
     .map(spaced)
     .join('');
-  const keyboardSetup = out.kbdSetup
-    ? out.kbdSetup +
+  const keyboardSetup = keyboard
+    ? keyboard.setup +
       ' /* app-supplied on-screen keyboard layout/appearance */\n'
     : '';
   const initialUpdate = hasUpdate
@@ -1071,8 +899,8 @@ void er_app_build(int screen_w, int screen_h)
     p.height = (int16_t)screen_h;
     er_node_set_props(root, &p);
 ${animCreate ? '\n' + animCreate + '\n' : ''}
-${out.build.join('\n')}
-    er_tree_append_child(root, ${rootNodeId});
+${buildLines}
+    er_tree_append_child(root, ${app.root.id});
     er_tree_set_root(root);
 ${keyboardSetup}${initialUpdate}${mountEffectsBlock}}
 `;
@@ -1099,8 +927,8 @@ ${keyboardSetup}${initialUpdate}${mountEffectsBlock}}
  * needs a particular demo's useHostValue setters guards on \`#ifndef\` of its own marker, which names the
  * mismatch instead of leaving a pile of implicit-declaration errors for those setters.
  */
-#define ER_AOT_SCREEN_W ${screen.width}
-#define ER_AOT_SCREEN_H ${screen.height}
+#define ER_AOT_SCREEN_W ${opts.screen.width}
+#define ER_AOT_SCREEN_H ${opts.screen.height}
 #define ER_AOT_DEMO ${cstr(demo)}
 #define ${demoMarker(demo)} 1
 
@@ -1122,17 +950,13 @@ ${hostSetterProtos ? '\n' + hostSetterProtos + '\n' : ''}
 `;
 
   // The image imports the app references; the CLI resolves each path against the demo dir and bakes them.
-  const images = [...out.images.entries()].map(([name, importPath]) => ({
-    name,
-    importPath,
-  }));
   return {
     c: body,
     h: header,
     nodes: out.nodeCount,
     state: stateRecords.length,
-    handlers: out.handlers.length,
-    updates: out.updates.length,
-    images,
+    handlers: handlers.length,
+    updates: updates.length,
+    images: app.images,
   };
 }

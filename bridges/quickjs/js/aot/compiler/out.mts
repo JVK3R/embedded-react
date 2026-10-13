@@ -20,107 +20,57 @@
 
 import type {Program} from '@babel/types';
 import type {
+  IrAnimationCallback,
+  IrDepEffect,
+  IrEffectFunction,
+  IrHandler,
+  IrMountEffect,
+  IrStaticDecl,
+  IrTimerFunction,
+} from './ir/functions.mts';
+import type {IrPanResponder} from './ir/pan-responder.mts';
+import type {IrVectorData} from './ir/vectors.mts';
+import type {
   AnimRecord,
-  DynAssign,
-  FormatResult,
   FunctionNode,
   RefRecord,
   StateRecord,
-  StaticAssign,
 } from './types.mts';
-
-/*----------------------------------------------------------------------------------------------------------------------
- - Interfaces
- ---------------------------------------------------------------------------------------------------------------------*/
-
-/** A generated C function: `static void <name>(void)` with `body` as its lines. */
-export interface CFunction {
-  name: string;
-  body: string[];
-}
-
-/** A timer callback. Its slot is reserved before the body compiles (the body may add timers of its own). */
-export interface TimerFunction {
-  name: string;
-  body: string[] | null;
-}
-
-/** A node whose props depend on state: app_update() rebuilds its ERProps and re-applies them. */
-export interface NodeUpdate {
-  /** The node's variable (`n<id>`); its handle is the file-scope `s_n<id>`. */
-  nodeId: string;
-  styleAssigns: StaticAssign[];
-  dynAssigns: DynAssign[];
-  /** A dynamic text body, as one printf format and its arguments. */
-  text: FormatResult | null;
-  /** A C expression naming the image to show when the source is dynamic. */
-  imageName?: string | null;
-  /** A static TextInput placeholder. */
-  placeholder?: string | null;
-}
-
-/** A state-driven <Svg>: app_update() rebuilds its op-tape with build_svg<id>() and uploads it again. */
-export interface SvgUpdate {
-  id: number;
-  len: number;
-  nPaints: number;
-  nGrads: number;
-  /** The node's file-scope handle. */
-  nodeVar: string;
-}
-
-/** A PanResponder should-set predicate, compiled to a C function that returns its value. */
-export interface ResponderQuery {
-  name: string;
-  expr: string;
-}
 
 /*----------------------------------------------------------------------------------------------------------------------
  - Classes
  ---------------------------------------------------------------------------------------------------------------------*/
 
 /**
- * Everything the passes emit for one app. Each pass appends to it as the JSX tree is walked; compileSourceImpl
- * then lays the pieces out as app.gen.c: file-scope declarations, the builders, er_app_build, app_update, and
- * the event handlers.
+ * Everything the passes lower for one app besides its element tree: the functions, drawings, responders and
+ * effects, and the counters that name them. Each pass appends to it as the JSX tree is walked; writeApp then
+ * writes it out as app.gen.c.
  *
  * @class Out
  */
 export class Out {
   /** Engine nodes created so far */
   private nodes = 0;
-  /** Statements of er_app_build(), in order. */
-  build: string[] = [];
-  /** Event handlers, one C function each. */
-  readonly handlers: CFunction[] = [];
-  /** Nodes whose props app_update() re-applies. */
-  readonly updates: NodeUpdate[] = [];
-  /** Nodes that need a file-scope handle (`static ERNode* s_<v>`), for app_update or an imperative call. */
-  readonly handles: string[] = [];
+  /** Event handlers, one function each. */
+  readonly handlers: IrHandler[] = [];
   /** A useCallback's C handler, by component prefix and name, so each is emitted once. */
   readonly cbEmitted = new Map<string, string>();
-  /** File-scope vector op-tapes and paint tables. */
-  readonly vectorData: string[] = [];
-  /** build_svg<id>() functions that recompute a state-driven <Svg>. */
-  readonly vectorBuilders: string[] = [];
-  readonly svgUpdates: SvgUpdate[] = [];
+  /** File-scope vector op-tapes and paint tables, and the builders of state-driven drawings. */
+  readonly vectors: IrVectorData[] = [];
   /** Numbers the next <Svg> (its tapes are `s_svg<id>_…`). */
   svgN = 0;
   /** Whether the generated C calls into <math.h>. */
   needsMath = false;
-  readonly timerFns: TimerFunction[] = [];
+  readonly timerFns: IrTimerFunction[] = [];
   usesTimers = false;
-  /** Mount-once effect bodies, inlined at the end of er_app_build(). */
-  mountEffects: string[] = [];
-  /** on_complete callbacks that chain an animation sequence or loop. */
-  readonly animCbs: CFunction[] = [];
+  /** What er_app_build() runs last: mount-once effects, and the first run of each dep-driven one. */
+  readonly mountEffects: IrMountEffect[] = [];
+  /** Animations' on_complete callbacks: completions, completion waits, and chains. */
+  readonly animCbs: IrAnimationCallback[] = [];
   /** The owner number of each composition that completion waits belong to, by composition; `isStarted` once a start waits. */
   readonly animWaits = new Map<string, {owner: number; isStarted: boolean}>();
   /** Numbers the next animation sequence. */
   seqN = 0;
-  /** The on-screen keyboard's static tables and the er_app_build() line that installs them. */
-  kbdData = '';
-  kbdSetup = '';
   /** Image assets the app reaches: asset name → source-relative import path. */
   readonly images = new Map<string, string>();
   /** A dynamic image source was reached, so every imported image has to be baked. */
@@ -133,16 +83,15 @@ export class Out {
   readonly childAnimations: AnimRecord[] = [];
   /** Numbers the next effect. */
   effN = 0;
-  readonly effectFns: CFunction[] = [];
-  /** File-scope declarations the effects and animation loops need. */
-  readonly effectDecls: string[] = [];
-  /** app_update() blocks that re-run a dep-driven effect when one of its deps changed. */
-  readonly depEffects: string[] = [];
+  readonly effectFns: IrEffectFunction[] = [];
+  /** File-scope variables the effects and animation loops need. */
+  readonly effectDecls: IrStaticDecl[] = [];
+  /** Dep-driven effects, which app_update() re-runs when one of their deps changed. */
+  readonly depEffects: IrDepEffect[] = [];
   /** Numbers the next PanResponder. */
   panN = 0;
-  /** File-scope state for each PanResponder's gesture. */
-  readonly panDecls: string[] = [];
-  readonly queries: ResponderQuery[] = [];
+  /** Every PanResponder a node spreads, lowered once each. */
+  readonly panResponders: IrPanResponder[] = [];
   /** The module's function components, by name, for inlining. */
   readonly components: Map<string, FunctionNode>;
   /** The parsed module, for the passes that scan it again. */

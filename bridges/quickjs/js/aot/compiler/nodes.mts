@@ -31,7 +31,7 @@ import {
   lowerNodeText,
   collectTextSpans,
 } from './style-text.mts';
-import {compileHandler} from './handlers.mts';
+import {lowerHandler} from './handlers.mts';
 import {emitPanResponder, panSpreadTarget} from './pan-responder.mts';
 import {emitComponent, emitChildren} from './control-flow.mts';
 import {emitSvg} from './svg.mts';
@@ -42,12 +42,12 @@ import {emitActivityIndicator} from './elements/activity-indicator.mts';
 import {emitModal} from './elements/modal.mts';
 import {emitFlatList} from './elements/flat-list.mts';
 import {resolveImageAttrs} from './elements/image.mts';
-import {printNode} from './c/nodes.mts';
 import type * as t from '@babel/types';
 import type {AotError} from './diagnostics.mts';
 import type {Out} from './out.mts';
 import type {AnimBind} from './style-text.mts';
 import type {IrElement, IrNode, IrWire} from './ir/nodes.mts';
+import type {IrPressFade} from './ir/functions.mts';
 import type {
   DynAssign,
   EmitOptions,
@@ -236,8 +236,8 @@ function opacityLiteralOrThrow(value: unknown, attr: t.JSXAttribute): number {
  * Lowers <TouchableOpacity>'s press feedback: a Pressable node plus one synthetic animated value bound to its
  * opacity. Press-in snaps it to activeOpacity, press-out fades it back to whatever the style asks for. Flow A
  * builds the same thing out of hooks (TouchableOpacity.js); here the feedback runs on the engine's native
- * driver with no JS on the device at all. Returns the value's bind, and the two fades as handler-body lines for
- * the event loop to fold into its press handlers.
+ * driver with no JS on the device at all. Returns the value's bind, and the two fades for the event loop to
+ * fold into its press handlers.
  *
  * @param element  The <TouchableOpacity>.
  * @param nodeId  The node's variable.
@@ -247,7 +247,7 @@ function opacityLiteralOrThrow(value: unknown, attr: t.JSXAttribute): number {
  * @param out  Everything emitted so far.
  * @param scope  Compile-time constants in reach.
  *
- * @returns The opacity bind, and the fade to run on onPressIn and the one to run on onPressOut, as C lines.
+ * @returns The opacity bind, and the fade to run on onPressIn and the one to run on onPressOut.
  */
 function touchablePressFades(
   element: t.JSXElement,
@@ -257,7 +257,7 @@ function touchablePressFades(
   binds: AnimBind[],
   out: Out,
   scope: Scope,
-): {bind: AnimBind; fades: Record<string, string[]>} {
+): {bind: AnimBind; fades: Record<string, IrPressFade>} {
   // The press feedback owns the node's opacity, so the style may not animate it or drive it from state.
   const hasAnimatedOpacity = binds.some(
     bind => bind.prop === 'ER_PROP_OPACITY',
@@ -298,24 +298,19 @@ function touchablePressFades(
 
   // Bind a fresh animated value, starting at rest, to the node's opacity.
   const cVar = `s_av_press_${nodeId}`;
-  out.childAnimations.push({cVar, initCode: floatLit(restingOpacity)});
+  floatLit(restingOpacity); // a value C cannot write fails here, at the element
+  out.childAnimations.push({cVar, initial: restingOpacity});
 
   // Each fade is one timing animation of that value.
-  const fade = (targetOpacity: number, durationMs: number): string[] => [
-    '    {',
-    '        ERAnimConfig cfg;',
-    '        memset(&cfg, 0, sizeof(cfg));',
-    '        cfg.type = ER_ANIM_TIMING;',
-    `        cfg.duration_ms = ${durationMs};`,
-    '        cfg.easing = ER_EASE_QUAD_IN_OUT;',
-    `        er_anim_value_animate(${cVar}, ${floatLit(targetOpacity)}, &cfg);`,
-    '    }',
-  ];
   return {
     bind: {cVar, prop: 'ER_PROP_OPACITY'},
     fades: {
-      onPressIn: fade(activeOpacity, 0),
-      onPressOut: fade(restingOpacity, TOUCHABLE_RESTORE_MS),
+      onPressIn: {value: cVar, opacity: activeOpacity, durationMs: 0},
+      onPressOut: {
+        value: cVar,
+        opacity: restingOpacity,
+        durationMs: TOUCHABLE_RESTORE_MS,
+      },
     },
   };
 }
@@ -591,8 +586,9 @@ function emitNodeImpl(
         handlerName = `er_cb_${callbackKey}`;
         out.cbEmitted.set(callbackKey, handlerName);
         out.handlers.push({
+          kind: 'callback',
           name: handlerName,
-          body: compileHandler(env.callbacks.get(fn.name)!, env, state, out),
+          callback: lowerHandler(env.callbacks.get(fn.name)!, env, state, out),
         });
       }
     } else if (fn.type === 'Identifier' && env.fnProps?.has(fn.name)) {
@@ -600,8 +596,9 @@ function emitNodeImpl(
       const callbackProp = env.fnProps.get(fn.name)!;
       handlerName = `er_handler_${out.handlers.length}`;
       out.handlers.push({
+        kind: 'callback',
         name: handlerName,
-        body: compileHandler(
+        callback: lowerHandler(
           callbackProp.node,
           callbackProp.env,
           callbackProp.state,
@@ -611,8 +608,9 @@ function emitNodeImpl(
     } else if (isFn(fn)) {
       handlerName = `er_handler_${out.handlers.length}`;
       out.handlers.push({
+        kind: 'callback',
         name: handlerName,
-        body: compileHandler(fn, env, state, out),
+        callback: lowerHandler(fn, env, state, out),
       });
     } else {
       throw aotError(
@@ -627,8 +625,10 @@ function emitNodeImpl(
     if (pressFade) {
       const wrapperName = `er_handler_${out.handlers.length}`;
       out.handlers.push({
+        kind: 'pressFade',
         name: wrapperName,
-        body: [...pressFade, `    ${handlerName}(node, data, user_data);`],
+        fade: pressFade,
+        then: handlerName,
       });
       handlerName = wrapperName;
       fadesWired.add((attr.name as t.JSXIdentifier).name);
@@ -642,7 +642,12 @@ function emitNodeImpl(
     for (const eventName of ['onPressIn', 'onPressOut']) {
       if (fadesWired.has(eventName)) continue;
       const fadeHandlerName = `er_handler_${out.handlers.length}`;
-      out.handlers.push({name: fadeHandlerName, body: press.fades[eventName]});
+      out.handlers.push({
+        kind: 'pressFade',
+        name: fadeHandlerName,
+        fade: press.fades[eventName],
+        then: null,
+      });
       wiring.push({
         kind: 'event',
         event: EVENT_TYPES[eventName],
@@ -651,25 +656,19 @@ function emitNodeImpl(
     }
   }
 
-  // A PanResponder's functions are emitted on the first node that spreads it.
+  // A PanResponder is lowered on the first node that spreads it.
   for (const panResponder of panSpreads) {
-    emitPanResponder(panResponder, out, env, state);
-    wiring.push({kind: 'responder', pan: panResponder});
+    wiring.push({
+      kind: 'responder',
+      pan: emitPanResponder(panResponder, out, env, state),
+    });
   }
 
-  // The node is emitted before its children, whose lines follow its own.
-  emitIrNode(node, out);
+  checkInterpolations(node);
 
   // A <Text>'s children are its text, already consumed above.
   if (tag !== 'Text') {
-    node.children = emitChildren(
-      element.children,
-      nodeId,
-      scope,
-      out,
-      env,
-      state,
-    );
+    node.children = emitChildren(element.children, scope, out, env, state);
   }
 
   return {kind: 'node', id: nodeId, node};
@@ -724,17 +723,20 @@ function omitUndefinedAttrs(
 }
 
 /**
- * Emits a lowered node: its build lines, and its handle and app_update() entry when state drives it.
+ * Refuses an interpolation table holding a number C cannot write, at the element that binds it rather than when
+ * its build lines are written.
  *
  * @param node  The node.
- * @param out  Everything emitted so far.
  */
-export function emitIrNode(node: IrNode, out: Out): void {
-  const printed = printNode(node);
-  out.build.push(...printed.build);
-  if (printed.update) {
-    out.handles.push(node.id);
-    out.updates.push(printed.update);
+export function checkInterpolations(node: IrNode): void {
+  for (const wire of node.wiring) {
+    if (wire.kind !== 'bind' || !wire.bind.interp) continue;
+    for (const point of [
+      ...wire.bind.interp.input,
+      ...wire.bind.interp.output,
+    ]) {
+      floatLit(point);
+    }
   }
 }
 
