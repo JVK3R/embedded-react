@@ -49,6 +49,7 @@ import {compileKeyboardConfig} from './keyboard.mts';
 import {normalizeUndefined, parseApp} from './parse.mts';
 import {Out} from './out.mts';
 import {printWaitDeclarations} from './c/animations.mts';
+import {printPropValue} from './c/nodes.mts';
 import type {BlockStatement} from '@babel/types';
 import type {ResolvedOptions} from './options.mts';
 import type {
@@ -241,7 +242,7 @@ export function compileSourceImpl(
   // Emit the scene graph from the root JSX; `out` collects every generated fragment.
   const out = new Out(components, ast.program);
   compileKeyboardConfig(ast.program, out); // module-level setKeyboardConfig({...}) → static ERKeyboardConfig
-  const rootNodeId = emitNode(rootJSX, scope, out, env, state);
+  const rootNodeId = emitNode(rootJSX, scope, out, env, state).id;
 
   // Emit registered only the images it reached; a dynamic source can't be enumerated, so bake every import.
   if (out.bakeAllImages) {
@@ -396,7 +397,7 @@ export function compileSourceImpl(
         lines.push(`    p.${assign.field} = ${assign.expr};`);
       }
       for (const assign of update.dynAssigns) {
-        lines.push(`    p.${assign.field} = ${assign.code};`);
+        lines.push(`    p.${assign.field} = ${printPropValue(assign.value)};`);
       }
       if (update.placeholder != null) {
         lines.push(

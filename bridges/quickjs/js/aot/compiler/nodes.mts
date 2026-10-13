@@ -21,14 +21,14 @@
 import {NODE_TYPES} from '../style-map.mts';
 import {aotError, withLoc} from './diagnostics.mts';
 import {evalStaticOrThrow, evalStatic, foldScope} from './static-eval.mts';
-import {floatLit, cstr} from './c-syntax.mts';
-import {emitExpr} from './expressions.mts';
+import {floatLit} from './c-syntax.mts';
+import {lowerExpr} from './expressions.mts';
 import {isFn} from './collect.mts';
 import {
   attrExpr,
   collectStyleAssigns,
   EVENT_TYPES,
-  buildText,
+  lowerNodeText,
   collectTextSpans,
 } from './style-text.mts';
 import {compileHandler} from './handlers.mts';
@@ -42,10 +42,12 @@ import {emitActivityIndicator} from './elements/activity-indicator.mts';
 import {emitModal} from './elements/modal.mts';
 import {emitFlatList} from './elements/flat-list.mts';
 import {resolveImageAttrs} from './elements/image.mts';
+import {printNode} from './c/nodes.mts';
 import type * as t from '@babel/types';
 import type {AotError} from './diagnostics.mts';
 import type {Out} from './out.mts';
 import type {AnimBind} from './style-text.mts';
+import type {IrElement, IrNode, IrWire} from './ir/nodes.mts';
 import type {
   DynAssign,
   EmitOptions,
@@ -110,20 +112,18 @@ function resolveTag(openingElement: t.JSXOpeningElement): string {
 }
 
 /**
- * Captures `ref={myRef}` (a node ref from useRef) by storing the freshly created node handle in the ref's
- * slot.
+ * The node refs `ref={myRef}` stores the element's handle in (a node ref from useRef), marked used.
  *
- * @param nodeId  The node's variable.
  * @param openingElement  The element's opening tag.
- * @param out  Everything emitted so far.
  * @param env  The expression environment.
+ *
+ * @returns The refs' C slots.
  */
-export function emitRefBind(
-  nodeId: string,
+export function lowerRefBinds(
   openingElement: t.JSXOpeningElement,
-  out: Out,
   env: Env,
-): void {
+): string[] {
+  const refs: string[] = [];
   for (const attr of openingElement.attributes) {
     if (
       attr.type !== 'JSXAttribute' ||
@@ -142,12 +142,34 @@ export function emitRefBind(
     ) {
       const nodeRef = env.refs.get(refExpr.name)!;
       nodeRef.used = true;
-      out.build.push(`    ${nodeRef.cVar} = ${nodeId};`);
+      refs.push(nodeRef.cVar);
     } else {
       throw new Error(
         'AOT: ref={…} must reference a node ref declared with useRef()',
       );
     }
+  }
+
+  return refs;
+}
+
+/**
+ * Captures `ref={myRef}` (a node ref from useRef) by storing the freshly created node handle in the ref's
+ * slot (see lowerRefBinds).
+ *
+ * @param nodeId  The node's variable.
+ * @param openingElement  The element's opening tag.
+ * @param out  Everything emitted so far.
+ * @param env  The expression environment.
+ */
+export function emitRefBind(
+  nodeId: string,
+  openingElement: t.JSXOpeningElement,
+  out: Out,
+  env: Env,
+): void {
+  for (const ref of lowerRefBinds(openingElement, env)) {
+    out.build.push(`    ${ref} = ${nodeId};`);
   }
 }
 
@@ -234,8 +256,8 @@ function opacityLiteralOrThrow(value: unknown, attr: t.JSXAttribute): number {
  * Lowers <TouchableOpacity>'s press feedback: a Pressable node plus one synthetic animated value bound to its
  * opacity. Press-in snaps it to activeOpacity, press-out fades it back to whatever the style asks for. Flow A
  * builds the same thing out of hooks (TouchableOpacity.js); here the feedback runs on the engine's native
- * driver with no JS on the device at all. Returns the two fades as handler-body lines, for the event loop to
- * fold into its press handlers.
+ * driver with no JS on the device at all. Returns the value's bind, and the two fades as handler-body lines for
+ * the event loop to fold into its press handlers.
  *
  * @param element  The <TouchableOpacity>.
  * @param nodeId  The node's variable.
@@ -245,7 +267,7 @@ function opacityLiteralOrThrow(value: unknown, attr: t.JSXAttribute): number {
  * @param out  Everything emitted so far.
  * @param scope  Compile-time constants in reach.
  *
- * @returns The fade to run on onPressIn and the one to run on onPressOut, as C lines.
+ * @returns The opacity bind, and the fade to run on onPressIn and the one to run on onPressOut, as C lines.
  */
 function touchablePressFades(
   element: t.JSXElement,
@@ -255,7 +277,7 @@ function touchablePressFades(
   binds: AnimBind[],
   out: Out,
   scope: Scope,
-): Record<string, string[]> {
+): {bind: AnimBind; fades: Record<string, string[]>} {
   // The press feedback owns the node's opacity, so the style may not animate it or drive it from state.
   const hasAnimatedOpacity = binds.some(
     bind => bind.prop === 'ER_PROP_OPACITY',
@@ -297,9 +319,6 @@ function touchablePressFades(
   // Bind a fresh animated value, starting at rest, to the node's opacity.
   const cVar = `s_av_press_${nodeId}`;
   out.childAnimations.push({cVar, initCode: floatLit(restingOpacity)});
-  out.build.push(
-    `    er_anim_value_bind(${cVar}, ${nodeId}, ER_PROP_OPACITY);`,
-  );
 
   // Each fade is one timing animation of that value.
   const fade = (targetOpacity: number, durationMs: number): string[] => [
@@ -313,8 +332,11 @@ function touchablePressFades(
     '    }',
   ];
   return {
-    onPressIn: fade(activeOpacity, 0),
-    onPressOut: fade(restingOpacity, TOUCHABLE_RESTORE_MS),
+    bind: {cVar, prop: 'ER_PROP_OPACITY'},
+    fades: {
+      onPressIn: fade(activeOpacity, 0),
+      onPressOut: fade(restingOpacity, TOUCHABLE_RESTORE_MS),
+    },
   };
 }
 
@@ -331,7 +353,7 @@ function touchablePressFades(
  * @param state  The component's state table.
  * @param opts  How the element is placed.
  *
- * @returns The node's variable.
+ * @returns What the element lowered to.
  */
 function emitNodeImpl(
   element: t.JSXElement,
@@ -340,20 +362,35 @@ function emitNodeImpl(
   env: Env,
   state: StateTable,
   opts: EmitOptions = {},
-): string {
+): IrElement {
   // Drop props that fold to undefined, then hand each typed element to its own emitter.
   element = omitUndefinedAttrs(element, scope, env);
   const tag = resolveTag(element.openingElement);
-  if (tag === 'Svg') return emitSvg(element, scope, out, env, state, opts);
-  if (tag === 'Switch') return emitSwitch(element, scope, out, env, state);
-  if (tag === 'Dial') return emitDial(element, scope, out, env, state);
+  const typed = (node: IrNode): IrElement => ({
+    kind: 'node',
+    id: node.id,
+    node,
+  });
+  if (tag === 'Svg') {
+    return {
+      kind: 'node',
+      id: emitSvg(element, scope, out, env, state, opts),
+      node: null,
+    };
+  }
+  if (tag === 'Switch') {
+    return typed(emitSwitch(element, scope, out, env, state));
+  }
+  if (tag === 'Dial') return typed(emitDial(element, scope, out, env, state));
   if (tag === 'TextInput') {
-    return emitTextInput(element, scope, out, env, state);
+    return typed(emitTextInput(element, scope, out, env, state));
   }
   if (tag === 'ActivityIndicator') {
-    return emitActivityIndicator(element, scope, out, env);
+    return typed(emitActivityIndicator(element, scope, out, env));
   }
-  if (tag === 'Modal') return emitModal(element, scope, out, env, state);
+  if (tag === 'Modal') {
+    return typed(emitModal(element, scope, out, env, state));
+  }
   if (tag === 'FlatList') {
     return emitFlatList(element, scope, out, env, state, opts);
   }
@@ -432,7 +469,9 @@ function emitNodeImpl(
   const spans =
     tag === 'Text' ? collectTextSpans(element.children, scope, env) : null;
   const text =
-    tag === 'Text' && !spans ? buildText(element.children, scope, env) : null;
+    tag === 'Text' && !spans
+      ? lowerNodeText(element.children, scope, env)
+      : null;
   // An <Image>'s resize/tint are static, so fold them into staticAssigns for both the static and dynamic paths.
   const image = tag === 'Image' ? resolveImageAttrs(element, env, out) : null;
   if (image?.resizeMode) {
@@ -464,7 +503,7 @@ function emitNodeImpl(
       } catch {
         dynAssigns.push({
           field: 'display',
-          code: `((${emitExpr(expr, env).code}) ? ER_DISPLAY_FLEX : ER_DISPLAY_NONE)`,
+          value: {kind: 'visible', value: lowerExpr(expr, env)},
         });
       }
     }
@@ -499,92 +538,15 @@ function emitNodeImpl(
   }
 
   // A state-driven conditional flips `display` in app_update; pushed last to beat the element's visible/display.
-  if (opts.displayCode) {
+  if (opts.show) {
     dynAssigns.push({
       field: 'display',
-      code: `((${opts.displayCode}) ? ER_DISPLAY_FLEX : ER_DISPLAY_NONE)`,
+      value: {kind: 'shown', show: opts.show},
     });
   }
-
-  // Create the node and either apply fixed props once or register it for app_update().
-  const isDynamic =
-    !!text?.dynamic || dynAssigns.length > 0 || !!image?.imageNameDyn;
-
-  out.build.push(`    ${nodeId} = er_node_create(${nodeType});`);
-  if (isDynamic) {
-    // Props are (re)applied in app_update(), so just keep the handle; a dynamic <Image> name is re-printed there.
-    out.build.push(`    s_${nodeId} = ${nodeId};`);
-    out.handles.push(nodeId);
-    out.updates.push({
-      nodeId,
-      styleAssigns: staticAssigns,
-      text,
-      dynAssigns,
-      imageName: image?.imageNameDyn,
-    });
-  } else {
-    out.build.push(`    er_props_default(&p);`);
-    for (const assign of staticAssigns) {
-      out.build.push(`    p.${assign.field} = ${assign.expr};`);
-    }
-
-    if (text) {
-      out.build.push(
-        `    snprintf(p.text, sizeof(p.text), "%s", ${cstr(text.format.replace(/%%/g, '%'))});`,
-      );
-    }
-
-    if (image?.imageName != null) {
-      out.build.push(
-        `    snprintf(p.image_name, sizeof(p.image_name), "%s", ${cstr(image.imageName)});`,
-      );
-    }
-
-    out.build.push(`    er_node_set_props(${nodeId}, &p);`);
-  }
-
-  // Set inline text spans once; each inherits the node's base style unless it overrides it.
-  if (spans) {
-    out.build.push(
-      `    {`,
-      `        static const ERTextSpan spans_${nodeId}[] = {`,
-    );
-    for (const span of spans) {
-      out.build.push(
-        `            { ${span.text}, ${span.color}, ${span.font_size}, ${span.font_weight}, ` +
-          `${span.font_style}, ${span.text_decoration}, ${span.letter_spacing} },`,
-      );
-    }
-    out.build.push(
-      `        };`,
-      `        er_node_set_text_spans(${nodeId}, spans_${nodeId}, ${spans.length});`,
-      `    }`,
-    );
-  }
-
-  // Bind animated style props for the native driver to move with no per-frame JS; `interp` remaps the value first.
-  binds.forEach((bind, bindIndex) => {
-    if (bind.interp) {
-      const interp = bind.interp;
-      out.build.push(
-        `    {`,
-        `        static const ERInterpolation interp_${nodeId}_${bindIndex} = { { ` +
-          `${interp.input.map(floatLit).join(', ')} }, { ` +
-          `${interp.output.map(floatLit).join(', ')} }, ${interp.input.length}, ` +
-          `${interp.exLeft}, ${interp.exRight} };`,
-        `        er_anim_value_bind_interpolated(${bind.cVar}, ${nodeId}, ${bind.prop}, ` +
-          `&interp_${nodeId}_${bindIndex});`,
-        `    }`,
-      );
-    } else {
-      out.build.push(
-        `    er_anim_value_bind(${bind.cVar}, ${nodeId}, ${bind.prop});`,
-      );
-    }
-  });
 
   // <TouchableOpacity>'s own opacity binding, on top of any the style asked for.
-  const pressFades =
+  const press =
     tag === 'TouchableOpacity' && !isTouchableDisabled
       ? touchablePressFades(
           element,
@@ -597,7 +559,36 @@ function emitNodeImpl(
         )
       : null;
 
-  emitRefBind(nodeId, element.openingElement, out, env);
+  // A host node wires its binds (the press feedback's last), then its refs, events and PanResponders.
+  const wiring: IrWire[] = binds.map((bind, index) => ({
+    kind: 'bind',
+    bind,
+    index,
+  }));
+  if (press) {
+    wiring.push({kind: 'bind', bind: press.bind, index: binds.length});
+  }
+  for (const slot of lowerRefBinds(element.openingElement, env)) {
+    wiring.push({kind: 'ref', slot});
+  }
+
+  const node: IrNode = {
+    id: nodeId,
+    type: nodeType,
+    constantProps: staticAssigns,
+    stateProps: dynAssigns,
+    placeholder: null,
+    text,
+    image:
+      image?.imageNameDyn != null
+        ? {kind: 'value', value: image.imageNameDyn}
+        : image?.imageName != null
+          ? {kind: 'static', name: image.imageName, resetOnUpdate: false}
+          : null,
+    spans,
+    wiring,
+    children: [],
+  };
 
   // Compile each event prop into a handler; a disabled <TouchableOpacity> drops its press events.
   const fadesWired = new Set<string>();
@@ -656,7 +647,7 @@ function emitNodeImpl(
     }
 
     // Wrap the app's press-in/out with the fade; prepending would dim every other element sharing a useCallback.
-    const pressFade = pressFades?.[(attr.name as t.JSXIdentifier).name];
+    const pressFade = press?.fades[(attr.name as t.JSXIdentifier).name];
     if (pressFade) {
       const wrapperName = `er_handler_${out.handlers.length}`;
       out.handlers.push({
@@ -667,33 +658,45 @@ function emitNodeImpl(
       fadesWired.add((attr.name as t.JSXIdentifier).name);
     }
 
-    out.build.push(
-      `    er_event_set(${nodeId}, ${eventType}, ${handlerName}, NULL);`,
-    );
+    wiring.push({kind: 'event', event: eventType, handler: handlerName});
   }
 
   // Whichever end of the press the app did not handle itself is the fade on its own.
-  if (pressFades) {
+  if (press) {
     for (const eventName of ['onPressIn', 'onPressOut']) {
       if (fadesWired.has(eventName)) continue;
       const fadeHandlerName = `er_handler_${out.handlers.length}`;
-      out.handlers.push({name: fadeHandlerName, body: pressFades[eventName]});
-      out.build.push(
-        `    er_event_set(${nodeId}, ${EVENT_TYPES[eventName]}, ${fadeHandlerName}, NULL);`,
-      );
+      out.handlers.push({name: fadeHandlerName, body: press.fades[eventName]});
+      wiring.push({
+        kind: 'event',
+        event: EVENT_TYPES[eventName],
+        handler: fadeHandlerName,
+      });
     }
   }
 
-  // Wire PanResponder spreads, then the children; a <Text>'s children are its text, already consumed above.
+  // A PanResponder's functions are emitted on the first node that spreads it.
   for (const panResponder of panSpreads) {
-    emitPanResponder(panResponder, nodeId, out, env, state);
+    emitPanResponder(panResponder, out, env, state);
+    wiring.push({kind: 'responder', pan: panResponder});
   }
 
+  // The node is emitted before its children, whose lines follow its own.
+  emitIrNode(node, out);
+
+  // A <Text>'s children are its text, already consumed above.
   if (tag !== 'Text') {
-    emitChildren(element.children, nodeId, scope, out, env, state);
+    node.children = emitChildren(
+      element.children,
+      nodeId,
+      scope,
+      out,
+      env,
+      state,
+    );
   }
 
-  return nodeId;
+  return {kind: 'node', id: nodeId, node};
 }
 
 /**
@@ -742,6 +745,21 @@ function omitUndefinedAttrs(
         ...element,
         openingElement: {...element.openingElement, attributes: keptAttrs},
       };
+}
+
+/**
+ * Emits a lowered node: its build lines, and its handle and app_update() entry when state drives it.
+ *
+ * @param node  The node.
+ * @param out  Everything emitted so far.
+ */
+export function emitIrNode(node: IrNode, out: Out): void {
+  const printed = printNode(node);
+  out.build.push(...printed.build);
+  if (printed.update) {
+    out.handles.push(node.id);
+    out.updates.push(printed.update);
+  }
 }
 
 /** Lowers one JSX element to its engine node; an AOT error it throws is pinned to the element. */
