@@ -26,7 +26,8 @@ import {
   staticInt,
   isTime64,
   constDivisor,
-  emitExprWide,
+  emitSourcedWide,
+  lowerSource,
   lowerExpr,
   lowerExprWide,
   lowerText,
@@ -55,8 +56,18 @@ import {armedFlag} from './c/functions.mts';
 import {toCExpr} from './c/expressions.mts';
 import type * as t from '@babel/types';
 import type {Out} from './out.mts';
-import type {IrExpr, IrTyped} from './ir/expressions.mts';
+import type {IrExpr} from './ir/expressions.mts';
+import {
+  INT,
+  isConvertible64,
+  isIntSlot,
+  isTime,
+  refType,
+  slotOf,
+} from './ir/types.mts';
 import type {IrDepEffect} from './ir/functions.mts';
+import type {IrSource} from './ir/source.mts';
+import type {WideSlot} from './ir/types.mts';
 import type {
   IrCallback,
   IrItemValue,
@@ -85,7 +96,7 @@ import type {
  ---------------------------------------------------------------------------------------------------------------------*/
 
 /** The constant 0, which a remainder by 0 or ±1 stores. */
-const ZERO: IrExpr = {kind: 'number', value: 0, cType: 'int'};
+const ZERO: IrExpr = {kind: 'number', value: 0, type: INT};
 
 /** Each updateVector shape key and the numbers its array takes, for errors. */
 const UPDATE_VECTOR_ARGS: Record<string, string> = {
@@ -199,7 +210,7 @@ function lowerListOp(
         {
           kind: 'sliceItems',
           list: listState,
-          end: {kind: 'number', value: clampedEnd, cType: 'int'},
+          end: {kind: 'number', value: clampedEnd, type: INT},
         },
       ];
     }
@@ -228,33 +239,42 @@ function blockList(node: t.Statement): t.Statement[] {
 }
 
 /**
- * Checks a value written to a numeric state or ref slot, whose C type came from its initial value. A 64-bit
- * timestamp written to an int slot is recorded in env.found, and compileWidened compiles again with that
- * slot widened to int64_t. It cannot go into a float or boolean slot (a 64-bit constant can go into a float
- * one), and a widened slot takes no floats.
+ * Checks a value written to a numeric state or ref slot, whose C type came from its initial value. Every value
+ * written to an int slot is recorded in env.stores, from which the typing pass infers the slots that hold a
+ * 64-bit timestamp, and compileWidened compiles again with those slots widened to int64_t. A timestamp cannot
+ * go into a float or boolean slot (a 64-bit constant can go into a float one), and a widened slot takes no
+ * floats.
  *
- * @param value  The lowered value.
+ * @param lowered  The value: its source, and its type.
  * @param slotType  The slot's C kind.
  * @param isBool  The slot holds a boolean.
- * @param slotCName  The slot's C name, for env.found.
+ * @param widened  What the slot holds, if it was widened to 64 bits.
+ * @param slotCName  The slot's C name, for env.stores.
  * @param slotDescription  The slot, for the message.
  * @param env  The expression environment.
  */
 function storeCheck(
-  value: IrTyped,
+  lowered: {source: IrSource; expr: IrExpr},
   slotType: CType,
   isBool: boolean,
+  widened: WideSlot | undefined,
   slotCName: string,
   slotDescription: string,
   env: Env,
 ): void {
-  if (value.cType === 'i64' && slotType !== 'i64') {
-    if (slotType === 'int' && !isBool) {
-      env.found.add(slotCName);
-      return;
-    }
+  const value = lowered.expr;
+  if ((slotType === 'int' && !isBool) || widened === 'number') {
+    env.stores.push({
+      slot: slotCName,
+      value: lowered.source,
+      math64: Boolean(env.math64),
+    });
+  }
 
-    if (value.lit && slotType === 'float') return;
+  if (value.type.kind === 'int64' && slotType !== 'i64') {
+    if (slotType === 'int' && !isBool) return;
+
+    if (isConvertible64(value.type) && slotType === 'float') return;
 
     throw aotError(
       `AOT: a 64-bit time value cannot be stored in ${slotDescription}`,
@@ -262,7 +282,7 @@ function storeCheck(
     );
   }
 
-  if (slotType === 'i64' && value.cType === 'float') {
+  if (slotType === 'i64' && value.type.kind === 'float') {
     throw mix64Error();
   }
 }
@@ -276,8 +296,8 @@ function storeCheck(
  * @returns The value as an int.
  */
 const asInt = (value: IrExpr): IrExpr =>
-  value.cType === 'float'
-    ? {kind: 'toInt', operand: value, cType: 'int'}
+  value.type.kind === 'float'
+    ? {kind: 'toInt', operand: value, type: INT}
     : value;
 
 /**
@@ -301,7 +321,7 @@ const storeValue = (value: IrExpr, slotType: CType): IrExpr =>
 const refRead = (ref: RefRecord): IrExpr => ({
   kind: 'ref',
   ref,
-  cType: ref.cType as CType,
+  type: refType(ref),
 });
 
 /**
@@ -321,14 +341,16 @@ function lowerScalarSet(
 ): IrStmt {
   if (scalarState.cType !== 'string') {
     // A 64-bit slot takes int `+ - *` worked out in 64 bits.
-    const value = lowerExprWide(
+    const lowered = lowerSource(
       valueNode,
       scalarState.cType === 'i64' ? {...env, math64: true} : env,
     );
+    const value = lowered.expr;
     storeCheck(
-      value,
+      lowered,
       scalarState.cType,
       scalarState.isBool,
+      scalarState.widened,
       scalarState.cField,
       `state "${scalarState.name}"`,
       env,
@@ -658,12 +680,14 @@ function inlineHelperCall(
     }
 
     if (args[paramIndex]) {
-      const argExpr = emitExprWide(args[paramIndex], env);
+      const argExpr = emitSourcedWide(args[paramIndex], env);
       locals.set(param.name, {
         code: argExpr.code,
         cType: argExpr.cType,
         isBool: argExpr.isBool,
         lit: argExpr.lit,
+        wide: argExpr.wide,
+        source: argExpr.source,
       });
     }
   });
@@ -749,11 +773,10 @@ function lowerHandlerExprImpl(
 
     // Lower the right side in the ref's width and check it fits; a 64-bit `%=` keeps its constant divisor.
     const refEnv = ref.cType === 'i64' ? {...env, math64: true} : env;
-    const valueExpr = lowerExprWide(expr.right, refEnv);
-    if (
-      expr.operator === '/=' &&
-      (ref.cType === 'i64' || isTime64(valueExpr))
-    ) {
+    const loweredValue = lowerSource(expr.right, refEnv);
+    const valueExpr = loweredValue.expr;
+    const refHoldsTime = isTime(refType(ref));
+    if (expr.operator === '/=' && (refHoldsTime || isTime64(valueExpr))) {
       throw aotError(
         'AOT: `/=` on a 64-bit time value is not supported',
         'JS division gives a fraction; write ref.current = Math.floor(ref.current / n) for whole units.',
@@ -761,13 +784,14 @@ function lowerHandlerExprImpl(
     }
 
     const wideModDivisor =
-      expr.operator === '%=' && (ref.cType === 'i64' || isTime64(valueExpr))
+      expr.operator === '%=' && (refHoldsTime || isTime64(valueExpr))
         ? constDivisor(expr.right, env)
         : null;
     storeCheck(
-      valueExpr,
+      loweredValue,
       ref.cType as CType,
       false,
+      ref.kind === 'value' ? ref.widened : undefined,
       ref.cVar,
       `ref "${((expr.left as t.MemberExpression).object as t.Identifier).name}"`,
       env,
@@ -780,11 +804,11 @@ function lowerHandlerExprImpl(
     )[expr.operator];
     const isFloatMod =
       expr.operator === '%=' &&
-      (ref.cType === 'float' || valueExpr.cType === 'float');
+      (ref.cType === 'float' || valueExpr.type.kind === 'float');
     if (
       (isWholeRef &&
         (binaryOp ||
-          (expr.operator === '/=' && valueExpr.cType === 'float'))) ||
+          (expr.operator === '/=' && valueExpr.type.kind === 'float'))) ||
       isFloatMod
     ) {
       const resultExpr = lowerExprWide(
@@ -808,10 +832,15 @@ function lowerHandlerExprImpl(
       ];
     }
 
-    // Int `/=` and `%=` use app_div/app_mod for JS's answer; a constant divisor other than 0 or -1 needs no check.
+    // Whole-number `/=` and `%=` use app_div/app_mod for JS's answer, in 64 bits on a 64-bit ref that holds no
+    // time; a constant divisor other than 0 or -1 needs no check.
+    const isWholeValue =
+      isIntSlot(valueExpr.type) ||
+      (valueExpr.type.kind === 'int64' && !isTime64(valueExpr));
+    const refBits = ref.cType === 'i64' ? 64 : 32;
     if (
-      ref.cType === 'int' &&
-      valueExpr.cType === 'int' &&
+      ((ref.cType === 'int' && isIntSlot(valueExpr.type)) ||
+        (ref.cType === 'i64' && !refHoldsTime && isWholeValue)) &&
       (expr.operator === '/=' || expr.operator === '%=')
     ) {
       const staticDivisor = staticInt(expr.right, env);
@@ -827,9 +856,9 @@ function lowerHandlerExprImpl(
             value: {
               kind: 'helper',
               helper: 'div',
-              bits: 32,
+              bits: refBits,
               args: [refRead(ref), valueExpr],
-              cType: 'int',
+              type: refType(ref),
             },
           },
         ];
@@ -851,9 +880,9 @@ function lowerHandlerExprImpl(
             value: {
               kind: 'helper',
               helper: 'mod',
-              bits: 32,
+              bits: refBits,
               args: [refRead(ref), valueExpr],
-              cType: 'int',
+              type: refType(ref),
             },
           },
         ];
@@ -898,8 +927,8 @@ function lowerHandlerExprImpl(
             kind: 'helper',
             helper: expr.operator === '++' ? 'add' : 'sub',
             bits: ref.cType === 'i64' ? 64 : 32,
-            args: [refRead(ref), {kind: 'number', value: 1, cType: 'int'}],
-            cType: ref.cType,
+            args: [refRead(ref), {kind: 'number', value: 1, type: INT}],
+            type: refType(ref),
           },
         },
       ];
@@ -980,13 +1009,16 @@ function lowerHandlerExprImpl(
     (setterArg.type === 'ArrowFunctionExpression' ||
       setterArg.type === 'FunctionExpression')
   ) {
-    // setState(prev => expr): bind the param to the current value, assign the result.
+    // setState(prev => expr): bind the param to the current value, typed as a read of it, and assign the result.
     const prevParam = (setterArg.params[0] as t.Identifier | undefined)?.name;
     const locals = new Map<string, Local>(env.locals);
     if (prevParam) {
       locals.set(prevParam, {
         code: targetState.cMember,
         cType: targetState.cType,
+        isBool: targetState.isBool,
+        ...(targetState.widened === 'number' ? {lit: true} : {}),
+        source: {kind: 'state', state: targetState, loc: undefined},
       });
     }
 
@@ -1094,8 +1126,11 @@ export function lowerStmts(
         }
 
         // Any other initializer must lower to a number, a boolean or a string.
-        const initExpr = lowerExprWide(decl.init, env);
-        if (initExpr.cType === 'string') {
+        const {source: initSource, expr: initExpr} = lowerSource(
+          decl.init,
+          env,
+        );
+        if (initExpr.type.kind === 'string') {
           // Copy into a buffer of its own; aliasing a state slot would hide a self-read like `setLabel(t + '!')`.
           if (isHoisted) {
             ctx.hoist!.decls.push({
@@ -1105,11 +1140,8 @@ export function lowerStmts(
             });
           }
         } else {
-          if (
-            initExpr.cType !== 'int' &&
-            initExpr.cType !== 'float' &&
-            initExpr.cType !== 'i64'
-          ) {
+          const slot = slotOf(initExpr.type);
+          if (slot !== 'int' && slot !== 'float' && slot !== 'i64') {
             throw aotError(
               'AOT: a handler local must hold a number, a boolean or a string',
               'bind the value itself — e.g. `const id = item.id` — rather than a list item or a node ref.',
@@ -1120,7 +1152,7 @@ export function lowerStmts(
             ctx.hoist!.decls.push({
               kind: 'local',
               name: cName,
-              cType: initExpr.cType,
+              cType: slot,
             });
           }
         }
@@ -1137,9 +1169,9 @@ export function lowerStmts(
         env = {
           ...env,
           locals: new Map(env.locals).set(decl.id.name, {
+            ...toCExpr(initExpr),
             code: cName,
-            cType: initExpr.cType,
-            isBool: initExpr.isBool,
+            source: initSource,
           }),
         };
       }

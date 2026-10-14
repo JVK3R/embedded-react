@@ -27,10 +27,11 @@ import {
   evalStaticOr,
 } from './static-eval.mts';
 import {INT_MAX, lowerExpr} from './expressions.mts';
-import {NO_WIDE, isFn} from './collect.mts';
+import {NO_WIDE, isFn, wideInitial} from './collect.mts';
 import {lowerStmts} from './handlers.mts';
 import {isPanCreate} from './pan-responder.mts';
 import type * as t from '@babel/types';
+import type {SlotWidths} from './ir/types.mts';
 import type {
   IrAnimation,
   IrAnimationStart,
@@ -222,7 +223,7 @@ export function collectRefs(
   fnBody: t.BlockStatement | t.Expression,
   scope: Scope,
   prefix = '',
-  wide: Set<string> = NO_WIDE,
+  wide: SlotWidths = NO_WIDE,
 ): Map<string, RefRecord> {
   // Collect ref records by their JS binding name.
   const refs = new Map<string, RefRecord>();
@@ -277,12 +278,19 @@ export function collectRefs(
           throw error;
         }
 
-        // A ref a timestamp is written to holds 64 bits (see compileWidened).
-        const cType = !Number.isInteger(value)
-          ? 'float'
-          : wide.has(cVar)
-            ? 'i64'
-            : 'int';
+        // A ref a timestamp or a number past the int range is written to hold 64 bits (see compileWidened).
+        const initialWidth = wideInitial(value);
+        const widened =
+          Number.isInteger(value) && initialWidth !== 'float'
+            ? (wide.get(cVar) ??
+              (initialWidth === 'number' ? 'number' : undefined))
+            : undefined;
+        const cType =
+          !Number.isInteger(value) || initialWidth === 'float'
+            ? 'float'
+            : widened
+              ? 'i64'
+              : 'int';
         if (cType === 'float') {
           checkNumber(value);
         }
@@ -292,6 +300,7 @@ export function collectRefs(
           initial: value,
           kind: 'value',
           used: false,
+          ...(widened ? {widened} : {}),
         });
       }
     }

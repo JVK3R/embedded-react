@@ -54,7 +54,7 @@ const env = {
   refs: new Map(),
   math64: false,
   caps: {listCap: 8, listStrCap: 48, maxTextSpans: 4},
-  found: new Set(),
+  stores: [],
 };
 
 /** The responder `pan` a component body declares with this config, given gesture id 1. */
@@ -85,7 +85,7 @@ describe('PanResponder IR: gesture fields', () => {
     const visit = node => {
       if (node && typeof node === 'object') {
         if (node.kind === 'gesture') {
-          fields.push([node.field, node.cType, printExpr(node)]);
+          fields.push([node.field, node.type.kind, printExpr(node)]);
         }
         Object.values(node).forEach(visit);
       }

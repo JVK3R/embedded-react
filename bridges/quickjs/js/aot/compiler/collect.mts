@@ -26,6 +26,7 @@ import {aotError} from './diagnostics.mts';
 import {evalStaticOrThrow, evalStatic, withUndefined} from './static-eval.mts';
 import {cConstant, cTypeOfValue} from './c-syntax.mts';
 import type * as t from '@babel/types';
+import type {SlotWidths} from './ir/types.mts';
 import type {AotError} from './diagnostics.mts';
 import type {Screen} from './options.mts';
 import type {
@@ -48,7 +49,24 @@ import type {
  ---------------------------------------------------------------------------------------------------------------------*/
 
 /** No state or ref slot widened to 64 bits — the collectors' default. */
-export const NO_WIDE = new Set<string>();
+export const NO_WIDE: SlotWidths = new Map();
+
+/**
+ * What a whole-number initial value needs beyond an int slot, typed as a constant of its size is: nothing in
+ * the int range, a 64-bit number past it, a float past 64 bits.
+ *
+ * @param value  The initial value.
+ *
+ * @returns 'number' for a 64-bit slot, 'float' for a float one, or null for an int.
+ */
+export const wideInitial = (value: unknown): 'number' | 'float' | null =>
+  typeof value !== 'number' || !Number.isInteger(value)
+    ? null
+    : value < -(2 ** 63) || value >= 2 ** 63
+      ? 'float'
+      : value < -(2 ** 31) || value > 2 ** 31 - 1
+        ? 'number'
+        : null;
 
 const IMAGE_EXT_RE = /\.(png|jpe?g|webp|gif|bmp)$/i;
 
@@ -254,7 +272,7 @@ export function collectState(
   scope: Scope,
   caps: Caps,
   prefix = '',
-  wide: Set<string> = NO_WIDE,
+  wide: SlotWidths = NO_WIDE,
 ): StateTable {
   // Index each state by its JS name and, when it has one, by its setter's name.
   const byName = new Map<string, StateRecord>();
@@ -382,8 +400,19 @@ export function collectState(
           cType = 'float';
         }
 
-        // A setter stores a timestamp in it, so it holds 64 bits (see compileWidened).
-        if (cType === 'int' && !isBool && wide.has(cField)) {
+        // A whole number past the int range starts it 64-bit (past 64 bits, a float), as does a setter that
+        // stores a timestamp or such a number in it (see compileWidened).
+        const initialWidth = cType === 'int' ? wideInitial(initValue) : null;
+        if (initialWidth === 'float') {
+          cType = 'float';
+        }
+
+        const widened =
+          cType === 'int' && !isBool
+            ? (wide.get(cField) ??
+              (initialWidth === 'number' ? 'number' : undefined))
+            : undefined;
+        if (widened) {
           cType = 'i64';
         }
 
@@ -405,6 +434,7 @@ export function collectState(
           cMember: `s_state.${cField}`,
           initial,
           host: isHost, // host-fed → also emit a public er_app_set_<name>() setter
+          ...(widened ? {widened} : {}),
         };
       }
 

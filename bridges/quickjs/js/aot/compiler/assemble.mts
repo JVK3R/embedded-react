@@ -45,6 +45,8 @@ import {printVectorBlocks, printVectorRebuild} from './c/vectors.mts';
 import {isStateDriven, nodesOf, stateDrivenVectorOf} from './ir/nodes.mts';
 import type {ResolvedOptions} from './options.mts';
 import type {IrApp} from './ir/app.mts';
+import type {IrSlotStore} from './ir/source.mts';
+import type {SlotWidths} from './ir/types.mts';
 import type {
   AssetImport,
   ItemField,
@@ -112,7 +114,7 @@ export const demoMarker = (demo: string): string =>
  * @param demo  Demo name (only used in the generated-by header comment).
  * @param opts  compileSource's options, resolved (see resolveOptions).
  * @param wide  State/ref slots to declare 64-bit (see compileWidened).
- * @param found  Collects the int slots a 64-bit timestamp was stored in.
+ * @param stores  Collects every value stored into an int slot.
  *
  * @returns The generated app.gen.c and app.gen.h, and what they contain.
  */
@@ -120,9 +122,9 @@ export const compileSourceImpl = (
   src: string,
   demo: string,
   opts: ResolvedOptions,
-  wide: Set<string>,
-  found: Set<string>,
-): CompileResult => writeApp(lowerApp(src, opts, wide, found), demo, opts);
+  wide: SlotWidths,
+  stores: IrSlotStore[],
+): CompileResult => writeApp(lowerApp(src, opts, wide, stores), demo, opts);
 
 /**
  * Writes a lowered app as C: file-scope state, declarations and functions, then er_app_build(), in

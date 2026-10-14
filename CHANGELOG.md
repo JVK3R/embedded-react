@@ -57,6 +57,17 @@ See [Releasing](https://embedded-react.dev/internals/releasing) for the release 
   non-number (`fillGrad={{type: 2, ax: 0 / 0, …}}`, `ax: 'oops'`) fails with an `AOT:` error. It used to be
   computed at runtime, or written into the generated C as an invalid cast.
 
+- In Flow B, the parameter of a `setX(prev => …)` updater keeps the state's boolean type, so `prev === 1` is
+  false for a boolean, as in JS. It used to compare the boolean as the number 1.
+
+- In Flow B, a whole number past the int range is no longer treated as a `Date.now()` time where no time is
+  involved: a state, ref, local or updater parameter that only ever holds such numbers, a `+` on one, math
+  with one, a float `Math` function of one, and a ternary or `&&` / `||` that picks one. They convert to float
+  and divide by any number, as JS numbers do. They used to fail with "a 64-bit time value" errors.
+
+- In Flow B, a `useState` or `useRef` that starts at a whole number past the int range starts 64-bit (past 64
+  bits, a float). It used to write the value into an `int`.
+
 - An auto-height row with `flexWrap: 'wrap'` grows to hold every wrapped line. It used to reserve a single line's
   height, so the lines below painted over the siblings that follow it. Measurement now takes the width the parent
   offers and breaks the row into lines at that width, as Yoga does.
