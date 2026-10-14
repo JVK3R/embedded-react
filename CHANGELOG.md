@@ -12,15 +12,14 @@ See [Releasing](https://embedded-react.dev/internals/releasing) for the release 
 ## [Unreleased]
 ### Changed
 
-- The Flow B compiler is split from one 8,300-line `aot/compile.mjs` into a module per stage under
-  `aot/compiler/`, and is now written in TypeScript. The generated C is byte-identical and the npm package
-  still ships JavaScript. From a repo checkout the compiler runs as `npm run aot` (or `node aot/compile.mts`)
-  and needs Node 22.18 or later.
+- **Breaking (Flow B):** every element declares the props, style keys and children it lowers, and anything else
+  is an `AOT:` error at the prop: an unknown prop, a style key the engine doesn't draw on that element
+  (`opacity` on a `<Text>`), text outside a `<Text>`, or children on an `<Image>`. Props that were accepted
+  and ignored (`<TextInput autoFocus>`, `<Modal transparent>`, a disabled `<Switch>`) are refused too.
+  All of these used to compile and do nothing on the device.
 
-- `compileSource` takes the screen size and the buffer caps as options (`screen`, `listCap`, `listStrCap`,
-  `maxTextSpans`). One left out still falls back to its `ER_AOT_*` variable, now read on each compile rather than
-  at import, so one process can compile for several boards. A compile error names the size it was given; with
-  a `screen` option it used to report the default.
+- The Flow B compiler is now a module per stage, written in TypeScript. The generated C and the npm package
+  are unchanged; running it from a repo checkout needs Node 22.18 or later.
 
 - Rendering uses far less stack, with identical pixels. Each level of the node tree costs 288 B instead of
   456 B on the RP2040, and 400 B instead of 1,488 B on the ESP32-S3. Drawing a Text costs 848 B
@@ -29,12 +28,16 @@ See [Releasing](https://embedded-react.dev/internals/releasing) for the release 
 - Anti-aliased text draws faster: 2- and 4-bit fonts look up each coverage level from a small per-glyph
   table, which replaces four divides per pixel.
 
-- In Flow B, every element declares the props, style keys and children it lowers, and anything else is an
-  `AOT:` error at the prop: an unknown prop, a style key the engine doesn't draw on that element
-  (`opacity` on a `<Text>`), text outside a `<Text>`, or children on an `<Image>`. Props that were accepted
-  and ignored (`<TextInput autoFocus>`, `<Modal transparent>`, a disabled `<Switch>`) are refused too.
-  All of these used to compile and do nothing on the device.
-  
+- A repaint that touches part of a scaled or tinted image (or of an RGB565 image drawn without a
+  `copy_rect_fmt` backend) converts only the repainted part instead of the whole image. A small repaint over
+  a 1880×880 bilinear-scaled image took about 20 ms on a desktop host, and now takes under 1 ms.
+
+### Added
+
+- `compileSource` takes the screen size and the buffer caps as options (`screen`, `listCap`, `listStrCap`,
+  `maxTextSpans`), so one process can compile for several boards. One left out still falls back to its
+  `ER_AOT_*` variable, now read on each compile rather than at import.
+
 ### Fixed
 
 - The RP2040 watch example gives its stack an explicit 8 KB with a guard below it. The watch face needs
@@ -65,10 +68,9 @@ See [Releasing](https://embedded-react.dev/internals/releasing) for the release 
   `stagger`, or only delays) calls its callback once the delays have passed, as Flow A does. It used to never
   call it.
 
-- In Flow B, a `.start(onComplete)` waits out a delay that ends a `sequence`, or a delay that outlasts the timing
-  beside it, before calling its callback. It used to call it as soon as the last animation finished. Stopping
-  the animation during that wait calls the callback with `finished: false`, as React Native does. A callback on a
-  spring or decay beside a longer delay is now an `AOT:` error, since a spring has no fixed length to wait against.
+- In Flow B, a `.start(onComplete)` waits out a trailing delay before calling its callback, as Flow A does. It
+  used to call it as soon as the last animation finished. A callback on a spring or decay beside a longer delay
+  is now an `AOT:` error.
 
 - A Flow B `updateVector` shape with too few numbers (`arc: [10, 20]`) or an empty slot (`[1, , 3, 4, 5]`) fails
   with an `AOT:` error. It used to write `undefined` into the generated C, or crash the compiler.
@@ -83,21 +85,14 @@ See [Releasing](https://embedded-react.dev/internals/releasing) for the release 
 - In Flow B, the parameter of a `setX(prev => …)` updater keeps the state's boolean type, so `prev === 1` is
   false for a boolean, as in JS. It used to compare the boolean as the number 1.
 
-- In Flow B, a whole number past the int range is no longer treated as a `Date.now()` time where no time is
-  involved: a state, ref, local or updater parameter that only ever holds such numbers, a `+` on one, math
-  with one, a float `Math` function of one, and a ternary or `&&` / `||` that picks one. They convert to float
-  and divide by any number, as JS numbers do. They used to fail with "a 64-bit time value" errors.
+- In Flow B, a whole number past the int range that isn't a `Date.now()` time behaves as a JS number: it
+  converts to float and divides by any number. It used to fail with "a 64-bit time value" errors.
 
 - In Flow B, a `useState` or `useRef` that starts at a whole number past the int range starts 64-bit (past 64
   bits, a float). It used to write the value into an `int`.
 
 - An auto-height row with `flexWrap: 'wrap'` grows to hold every wrapped line. It used to reserve a single line's
-  height, so the lines below painted over the siblings that follow it. Measurement now takes the width the parent
-  offers and breaks the row into lines at that width, as Yoga does.
-  
-- A repaint that touches part of a scaled or tinted image (or of an RGB565 image drawn without a
-  `copy_rect_fmt` backend) converts only the repainted part instead of the whole image. A small repaint over
-  a 1880×880 bilinear-scaled image took about 20 ms on a desktop host, and now takes under 1 ms.
+  height, so the lines below painted over the siblings that follow it.
 
 ## [0.15.0] - 2026-09-27
 ### Changed
