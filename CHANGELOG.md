@@ -10,6 +10,8 @@ ESP-IDF Component Registry, PlatformIO) — a single version drives every artifa
 See [Releasing](https://embedded-react.dev/internals/releasing) for the release process.
 
 ## [Unreleased]
+
+## [0.16.0] - 2026-10-14
 ### Changed
 
 - **Breaking (Flow B):** every element declares the props, style keys and children it lowers, and anything else
@@ -1341,7 +1343,8 @@ Initial public release.
 - Versioning foundation with a single source of truth propagated to every artifact.
 - The first publish to npm as embedded-react.
 
-[Unreleased]: https://github.com/TheMasterCoder007/embedded-react/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/TheMasterCoder007/embedded-react/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/TheMasterCoder007/embedded-react/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/TheMasterCoder007/embedded-react/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/TheMasterCoder007/embedded-react/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/TheMasterCoder007/embedded-react/compare/v0.13.0...v0.14.0
