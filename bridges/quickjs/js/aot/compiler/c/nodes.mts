@@ -23,7 +23,7 @@ import {printCondition, printExpr} from './expressions.mts';
 import {panEventName, panQueryName} from './pan-responder.mts';
 import {printText} from './text.mts';
 import {printStateDrivenVectorWiring, printVectorOps} from './vectors.mts';
-import {isStateDriven} from '../ir/nodes.mts';
+import {branchElements, isStateDriven} from '../ir/nodes.mts';
 import type {IrElement, IrNode, IrPropValue, IrShow} from '../ir/nodes.mts';
 import type {IrPanResponder} from '../ir/pan-responder.mts';
 import type {AnimBind} from '../style-text.mts';
@@ -70,7 +70,8 @@ export function printShow(show: IrShow): string {
   }
 
   const test = printCondition(show.test);
-  return show.negate ? `!(${test})` : test;
+  const shown = show.negate ? `!(${test})` : test;
+  return show.within ? `((${printShow(show.within)}) && (${shown}))` : shown;
 }
 
 /**
@@ -97,6 +98,8 @@ export function printPropValue(value: IrPropValue): string {
       return `((${printExpr(value.value)}) ? ER_DISPLAY_FLEX : ER_DISPLAY_NONE)`;
     case 'shown':
       return `((${printShow(value.show)}) ? ER_DISPLAY_FLEX : ER_DISPLAY_NONE)`;
+    case 'whileShown':
+      return `((${printShow(value.show)}) ? ${printPropValue(value.value)} : 0)`;
     case 'flag': {
       const test =
         value.truthiness === 'condition'
@@ -309,8 +312,7 @@ export function printElementTree(element: IrElement): string[] {
     if (child.kind === 'element') {
       appendChild(child.element);
     } else if (child.kind === 'conditional') {
-      appendChild(child.whenTrue);
-      appendChild(child.whenFalse);
+      branchElements(child).forEach(appendChild);
     } else {
       child.rows.forEach(appendChild);
     }
