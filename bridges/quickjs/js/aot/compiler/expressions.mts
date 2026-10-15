@@ -21,11 +21,19 @@
 import {attemptLowering, checkNumber} from './check.mts';
 import {traverse} from '@babel/core';
 import {aotError, locateError, withLoc} from './diagnostics.mts';
+import {
+  bootSlotOf,
+  containsBoot,
+  foldBoot,
+  isBoot,
+  wholeBootValue,
+} from './boot.mts';
 import {evalStatic, foldScope} from './static-eval.mts';
 import {lowerGestureField} from './pan-responder.mts';
 import {toCExpr} from './c/expressions.mts';
 import {printText} from './c/text.mts';
 import type * as t from '@babel/types';
+import type {BootValue} from './boot.mts';
 import type {AotError, SourcePosition} from './diagnostics.mts';
 import type {IrSlotStore, IrSource, IrSourceDivisor} from './ir/source.mts';
 import type {
@@ -108,6 +116,15 @@ const CHECKED_HELPER: Record<string, WholeHelper> = {
   '-': 'sub',
   '*': 'mul',
 };
+
+/** Expressions an app may write over values worked out at boot, which then read as one boot slot. */
+const WHOLE_BOOT_TYPES = new Set([
+  'BinaryExpression',
+  'UnaryExpression',
+  'LogicalExpression',
+  'ConditionalExpression',
+  'CallExpression',
+]);
 
 /** The range of a C int. */
 const INT_MIN = -(2 ** 31);
@@ -234,7 +251,7 @@ export function findShadowedClockCalls(ast: t.File): WeakSet<t.Node> {
  */
 export function staticInt(node: t.Node, env: Env): number | null {
   try {
-    const value = evalStatic(node, foldScope(env, env.consts ?? {}));
+    const value = evalStatic(node, foldScope(env, env.consts ?? {}), 'strict');
     return Number.isInteger(value) ? (value as number) : null;
   } catch {
     return null;
@@ -279,6 +296,104 @@ function numberSource(
   }
 
   return {kind: 'number', value, loc};
+}
+
+/**
+ * A read of a value worked out at boot. One boot cannot work out is taken at the build's panel instead, which
+ * the panel at boot must then give too.
+ *
+ * @param value  The value.
+ * @param loc  Where it is read.
+ *
+ * @returns Its source.
+ */
+function bootSource(
+  value: BootValue,
+  loc: SourcePosition | undefined,
+): IrSource {
+  const slot = bootSlotOf(value);
+  if (slot) {
+    return {kind: 'fixed', expr: {kind: 'boot', slot, type: slot.type}, loc};
+  }
+
+  const buildValue = foldBoot(value);
+  if (typeof buildValue === 'number') return numberSource(buildValue, loc);
+  if (typeof buildValue === 'string') {
+    return {kind: 'string', value: buildValue, loc};
+  }
+
+  if (typeof buildValue === 'boolean') {
+    return {kind: 'boolean', value: buildValue, loc};
+  }
+
+  throw new Error(
+    'AOT: a value derived from the panel size cannot be used in a dynamic expression',
+  );
+}
+
+/**
+ * Whether an expression names a binding that is, or holds, a value worked out at boot.
+ *
+ * @param node  The expression.
+ * @param scope  The constants it reads.
+ *
+ * @returns True when it does.
+ */
+function readsBootName(node: unknown, scope: Scope): boolean {
+  if (typeof node !== 'object' || node === null) return false;
+  if (Array.isArray(node)) return node.some(item => readsBootName(item, scope));
+  const typed = node as t.Node;
+  if (typed.type === 'Identifier') {
+    return typed.name in scope && containsBoot(scope[typed.name]);
+  }
+
+  // A member's name and an object key are not reads.
+  if (typed.type === 'MemberExpression') {
+    return (
+      readsBootName(typed.object, scope) ||
+      (typed.computed && readsBootName(typed.property, scope))
+    );
+  }
+
+  if (typed.type === 'ObjectProperty' && !typed.computed) {
+    return readsBootName(typed.value, scope);
+  }
+
+  return Object.entries(typed).some(
+    ([key, value]) => key !== 'loc' && readsBootName(value, scope),
+  );
+}
+
+/**
+ * An expression that depends only on the panel, read as a whole from its boot slot, so it is worked out once and
+ * in double precision. Null for one that also reads state, or that boot cannot work out.
+ *
+ * @param node  The expression.
+ * @param env  The expression environment.
+ * @param loc  Where it is.
+ *
+ * @returns Its source, or null.
+ */
+function wholeBootSource(
+  node: t.Node,
+  env: Env,
+  loc: SourcePosition | undefined,
+): IrSource | null {
+  const scope = foldScope(env, env.consts ?? {});
+  if (!readsBootName(node, scope)) return null;
+  let value: unknown;
+  try {
+    value = evalStatic(node, scope, 'boot');
+  } catch {
+    return null;
+  }
+
+  if (!isBoot(value) || !value.lowerable) return null;
+  const whole = wholeBootValue(node, scope, value);
+  const slot = whole && bootSlotOf(whole);
+  return slot
+    ? {kind: 'fixed', expr: {kind: 'boot', slot, type: slot.type}, loc}
+    : null;
 }
 
 /**
@@ -1303,6 +1418,12 @@ const binarySource = (
  */
 function sourceOf(node: t.Node, env: Env): IrSource {
   const loc = node.loc?.start;
+  // An expression that depends only on the panel is read from a slot worked out at boot, in doubles as JS.
+  const whole = WHOLE_BOOT_TYPES.has(node.type)
+    ? wholeBootSource(node, env, loc)
+    : null;
+  if (whole) return whole;
+
   const operand = (operandNode: t.Node): IrSource =>
     lowerSource(operandNode, env).source;
   switch (node.type) {
@@ -1331,6 +1452,7 @@ function sourceOf(node: t.Node, env: Env): IrSource {
 
       if (node.name in env.consts) {
         const constValue = env.consts[node.name];
+        if (isBoot(constValue)) return bootSource(constValue, loc);
         if (typeof constValue === 'number')
           return numberSource(constValue, loc);
 
@@ -1409,7 +1531,12 @@ function sourceOf(node: t.Node, env: Env): IrSource {
     case 'MemberExpression': {
       // Static fold: member access that resolves to a compile-time constant (e.g., a .map item's `.key`).
       try {
-        const constValue = evalStatic(node, foldScope(env, env.consts ?? {}));
+        const constValue = evalStatic(
+          node,
+          foldScope(env, env.consts ?? {}),
+          'boot',
+        );
+        if (isBoot(constValue)) return bootSource(constValue, loc);
         // A number with no float form falls through too, so its check runs now, not in the check pass.
         if (typeof constValue === 'number') {
           return attemptLowering(() => numberSource(constValue, loc));
@@ -1768,9 +1895,9 @@ function lowerTextParts(
     };
   }
 
-  // A compile-time constant becomes literal text.
+  // A compile-time constant becomes literal text; a value worked out at boot is a runtime value.
   try {
-    const constValue = evalStatic(node, scope);
+    const constValue = evalStatic(node, scope, 'strict');
     return {
       isString: typeof constValue === 'string',
       parts: [

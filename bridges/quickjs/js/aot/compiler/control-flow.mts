@@ -19,6 +19,8 @@
  ---------------------------------------------------------------------------------------------------------------------*/
 
 import {aotError} from './diagnostics.mts';
+import {foldBoot, isBoot} from './boot.mts';
+import {mergeBranchElements} from './branch-merge.mts';
 import {evalStatic, withUndefined} from './static-eval.mts';
 import {emitSourcedWide, lowerExpr} from './expressions.mts';
 import {
@@ -31,6 +33,7 @@ import {
   collectMemos,
   collectEffects,
   usesState,
+  bindConst,
 } from './collect.mts';
 import {collectAnims, collectRefs} from './animations.mts';
 import {attrExpr} from './style-text.mts';
@@ -164,9 +167,10 @@ function extractProps(
 
     // Any other prop folds to a constant when it can, else becomes a runtime C expression.
     try {
-      props[(attr.name as t.JSXIdentifier).name] = {
+      const propName = (attr.name as t.JSXIdentifier).name;
+      props[propName] = {
         static: true,
-        value: evalStatic(node, scope),
+        value: bindConst(propName, evalStatic(node, scope, 'boot')),
       };
     } catch {
       props[(attr.name as t.JSXIdentifier).name] = {
@@ -384,9 +388,9 @@ export function emitComponent(
         if (decl.id.type !== 'Identifier' || !decl.init) continue;
         if (childLocals.has(decl.id.name)) continue; // a dynamic prop of that name is already bound
         try {
-          childScope[decl.id.name] = evalStatic(
-            decl.init,
-            withUndefined(childScope),
+          childScope[decl.id.name] = bindConst(
+            decl.id.name,
+            evalStatic(decl.init, withUndefined(childScope), 'boot'),
           );
         } catch {
           // A dynamic const hides any same-named module const; a memo re-binds it below, else it stays unresolved.
@@ -443,7 +447,7 @@ export function emitComponent(
   // Resolve memos in order (fold, else a local C expr), then compile its effects, all in the child's env/state.
   for (const [name, expr] of childMemos) {
     try {
-      childScope[name] = evalStatic(expr, childScope);
+      childScope[name] = bindConst(name, evalStatic(expr, childScope, 'boot'));
     } catch {
       const cExpr = emitSourcedWide(expr, childEnv);
       childLocals.set(name, {
@@ -776,9 +780,19 @@ function lowerBranch(
     // A test that folds picks its branch at build time; `&&` with a false test renders nothing.
     let folded: {value: unknown} | null;
     try {
-      folded = {value: evalStatic(testNode, scope)};
+      folded = {value: evalStatic(testNode, scope, 'boot')};
     } catch {
       folded = null;
+    }
+
+    // A test that depends on the panel needs no variant when both branches are elements of one shape.
+    if (folded && isBoot(folded.value)) {
+      const merged =
+        whenTrue.type === 'JSXElement' && whenFalse?.type === 'JSXElement'
+          ? mergeBranchElements(testNode, whenTrue, whenFalse)
+          : null;
+      if (merged) return lowerBranch(merged, scope, out, env, state, within);
+      folded = {value: foldBoot(folded.value)};
     }
 
     if (folded) {

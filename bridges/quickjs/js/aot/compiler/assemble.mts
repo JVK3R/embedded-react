@@ -43,8 +43,14 @@ import {printElementTree, printNode, printNodeUpdate} from './c/nodes.mts';
 import {printPanDecls, printPanQuery} from './c/pan-responder.mts';
 import {CHANGED_FLAGS, printChangedFlag} from './c/statements.mts';
 import {printVectorBlocks, printVectorRebuild} from './c/vectors.mts';
-import {isStateDriven, nodesOf, stateDrivenVectorOf} from './ir/nodes.mts';
+import {
+  isStateDriven,
+  nodesOf,
+  stateDrivenVectorOf,
+  updatedVectorOf,
+} from './ir/nodes.mts';
 import {nodeReads, vectorReads} from './ir/reads.mts';
+import {hasBoot, printBootDecls, printBootFunction} from './c/boot.mts';
 import type {ResolvedOptions} from './options.mts';
 import type {IrApp} from './ir/app.mts';
 import type {IrSlotStore} from './ir/source.mts';
@@ -95,6 +101,10 @@ const LIBM_USE = new RegExp(
   '\\b(sinf|cosf|tanf|sqrtf|fabsf|roundf|floorf|ceilf|fminf|fmaxf|atan2f|powf|fmodf|isfinite|' +
     'app_roundf|app_ftoa|app_vector_dirty|M_PI)\\b',
 );
+
+// The double-precision libm symbols a value worked out at boot can call.
+const BOOT_LIBM_USE =
+  /\b(sin|cos|tan|sqrt|fabs|floor|ceil|fmin|fmax|atan2|pow|fmod|app_round)\(/;
 
 /*----------------------------------------------------------------------------------------------------------------------
  - Implementation
@@ -246,9 +256,11 @@ export function writeApp(
     ? `typedef struct\n{\n${watchedRecords.map(stateRecord => `    uint8_t ${stateRecord.cField};`).join('\n')}\n} ` +
       `ErAppChanged;\n\nstatic ErAppChanged ${CHANGED_FLAGS};\n`
     : '';
-  const stateBlock = [scalarBlock, listBlocks, changedBlock]
+  const bootDecls = printBootDecls(app.boot);
+  const stateBlock = [scalarBlock, listBlocks, changedBlock, bootDecls]
     .filter(Boolean)
     .join('\n');
+  const bootFn = printBootFunction(app.boot, opts.screen);
 
   // The nodes er_app_build() creates, each before its children, and what app_update() re-applies to them.
   const nodes = nodesOf(app.root);
@@ -327,7 +339,7 @@ export function writeApp(
         lines: printNodeUpdate(updates[index]),
       })),
       ...nodes.flatMap(node => {
-        const vector = stateDrivenVectorOf(node);
+        const vector = updatedVectorOf(node);
         return vector
           ? [
               {
@@ -542,8 +554,10 @@ static int16_t app_round_dim(double v)
   // Include <math.h> when the generated code, or a helper it calls, uses a libm symbol.
   const usesMath =
     out.needsMath ||
+    BOOT_LIBM_USE.test(bootFn) ||
     LIBM_USE.test(
       [
+        bootFn,
         stateBlock,
         refDecls,
         vectorBuilderBlock,
@@ -673,6 +687,16 @@ static int16_t app_round_dim(double v)
         '    return (int)v;\n}',
     ],
     [
+      'app_d2i',
+      '/* A double kept as an int, as app_f2i keeps a float: for a value worked out at boot, which a float ' +
+        'would round. */\n' +
+        'static int app_d2i(double v)\n{\n' +
+        '    if (v != v)\n    {\n        return 0;\n    }\n' +
+        '    if (v >= 2147483647.0)\n    {\n        return INT_MAX;\n    }\n' +
+        '    if (v <= -2147483648.0)\n    {\n        return INT_MIN;\n    }\n' +
+        '    return (int)v;\n}',
+    ],
+    [
       'app_roundf',
       "/* Math.round as JS rounds: to the nearest whole number, halves up (toward +Infinity). C's roundf takes\n" +
         '   halves away from zero, which gives -3 for -2.5 where JS gives -2. */\n' +
@@ -689,6 +713,12 @@ static int16_t app_round_dim(double v)
         '    if (isinf(v))\n    {\n        return v > 0.0f ? "Infinity" : "-Infinity";\n    }\n' +
         '    if (v == 0.0f)\n    {\n        return "0";\n    }\n' +
         '    snprintf(buf, 16, "%g", (double)v);\n    return buf;\n}',
+    ],
+    [
+      'app_round',
+      '/* Math.round as JS rounds, in double precision for a value worked out at boot: halves up. */\n' +
+        'static double app_round(double v)\n{\n' +
+        '    const double f = floor(v);\n    return v - f >= 0.5 ? f + 1.0 : f;\n}',
     ],
     [
       'app_opacity',
@@ -836,6 +866,7 @@ static int16_t app_round_dim(double v)
   // Generated code with literals and comments blanked, so only a real call emits a helper (unused statics warn).
   const helperCallers = stripCLiterals(
     [
+      bootFn,
       stateBlock,
       refDecls,
       vectorBuilderBlock,
@@ -935,6 +966,27 @@ static int16_t app_round_dim(double v)
     ? `\n${initialChanged}    app_update(); /* apply initial state-dependent props */\n`
     : '';
 
+  // er_app_fits() asks app_boot() without disturbing the values a built app reads.
+  const fitsBody = !hasBoot(app.boot)
+    ? ['    (void)screen_w;', '    (void)screen_h;', '    return true;']
+    : bootDecls
+      ? [
+          '    const ErAppBoot built = s_boot;',
+          '    const bool fits = app_boot(screen_w, screen_h);',
+          '    s_boot = built;',
+          '    return fits;',
+        ]
+      : ['    return app_boot(screen_w, screen_h);'];
+  const fitsFn =
+    'bool er_app_fits(int screen_w, int screen_h)\n{\n' +
+    fitsBody.join('\n') +
+    '\n}';
+  const bootCall = hasBoot(app.boot)
+    ? '\n    /* The values that depend on the panel size; a panel the app was not compiled for builds ' +
+      'nothing. */\n' +
+      '    if (!app_boot(screen_w, screen_h))\n    {\n        return false;\n    }\n'
+    : '';
+
   // app.gen.c: includes and version pin, then file-scope state, declarations and functions, then er_app_build().
   const body = `/*
  * Generated by the embedded-react Flow B AOT compiler (npm run aot -- ${demo}). DO NOT EDIT.
@@ -970,12 +1022,14 @@ void er_app_set_wall_clock(int64_t epoch_ms)
 {
     s_wall_offset_ms = epoch_ms - (int64_t)er_now_ms64();${hasUpdate ? '\n    s_wall_clock_changed = 1;' : ''}
 }
-${hostSettersBlock ? '\n' + hostSettersBlock + '\n' : ''}
-void er_app_build(int screen_w, int screen_h)
+${hostSettersBlock ? '\n' + hostSettersBlock + '\n' : ''}${bootFn ? '\n' + bootFn + '\n' : ''}
+${fitsFn}
+
+bool er_app_build(int screen_w, int screen_h)
 {
     ERProps p;
     ERNode* ${nodeDecls.join(';\n    ERNode* ')};
-
+${bootCall}
     /* A screen-sized root the app tree fills (mirrors AppRegistry mounting into a screen-sized host). */
     ERNode* root = er_node_create(ER_NODE_VIEW);
     er_props_default(&p);
@@ -986,7 +1040,8 @@ ${animCreate ? '\n' + animCreate + '\n' : ''}
 ${buildLines}
     er_tree_append_child(root, ${app.root.id});
     er_tree_set_root(root);
-${keyboardSetup}${initialUpdate}${mountEffectsBlock}}
+${keyboardSetup}${initialUpdate}${mountEffectsBlock}    return true;
+}
 `;
 
   // app.gen.h: what the file was generated for, and the app's public entry points.
@@ -994,16 +1049,14 @@ ${keyboardSetup}${initialUpdate}${mountEffectsBlock}}
 #ifndef ER_APP_GEN_H
 #define ER_APP_GEN_H
 
+#include <stdbool.h>
 #include <stdint.h>
 
 /*
- * What this file was generated FOR. er_app_build() takes the screen size at runtime, but a responsive app
- * folds its \`screen.width\`/\`screen.height\` branching at GENERATE time — so the layout in here is already
- * committed to these dimensions and no runtime argument can change it.
- *
- * Every board example consumes the same dist/app.gen.c, so generating for one board and then building
- * another produces firmware that compiles, links, boots, and lays out wrong. Boards \`_Static_assert\` these
- * against their own panel size to turn that into a compile error; see each board example's main.c.
+ * The panel this file was generated at. Values that depend only on the panel size are worked out at boot by
+ * er_app_build(), but a branch on \`screen\` that changes the tree was compiled for this panel only, and so
+ * was any value the compiler had to know. er_app_build() checks those at boot and builds nothing on a panel
+ * that differs in any of them, returning false; er_app_fits() asks the same without building.
  *
  * WHICH demo is recorded the same way, as a marker macro named ER_AOT_DEMO_<demo> with every character
  * outside [A-Za-z0-9] encoded as _<hex>_ (so \`watch-face\` defines ER_AOT_DEMO_watch_2d_face). The encoding
@@ -1016,8 +1069,15 @@ ${keyboardSetup}${initialUpdate}${mountEffectsBlock}}
 #define ER_AOT_DEMO ${cstr(demo)}
 #define ${demoMarker(demo)} 1
 
-/** @brief Builds the AOT-compiled app's scene graph + state machine (call once after backend init). */
-void er_app_build(int screen_w, int screen_h);
+/** @brief Builds the AOT-compiled app's scene graph + state machine (call once after backend init).
+ *  @return false, having built nothing, when the panel does not take the layout this file was compiled
+ *          for (see er_app_fits()). */
+bool er_app_build(int screen_w, int screen_h);
+
+/** @brief Whether a panel of this size takes the layout this file was compiled for. Values that depend only
+ *         on the panel size are worked out at boot, so any panel that takes the same layout fits; what the
+ *         compiler had to fold at its own panel (a branch that changes the tree, a font size) must match. */
+bool er_app_fits(int screen_w, int screen_h);
 
 /** @brief Advances app timers (setInterval/setTimeout). Call once per frame with the elapsed ms; a no-op
  *         for apps that use no timers, so it is always safe to call. */
