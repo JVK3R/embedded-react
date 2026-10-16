@@ -10,6 +10,9 @@ ESP-IDF Component Registry, PlatformIO) — a single version drives every artifa
 See [Releasing](https://embedded-react.dev/internals/releasing) for the release process.
 
 ## [Unreleased]
+### Fixed
+
+- In Flow A (QuickJS), `<Pressable disabled>` now withholds its press event handlers (`onPress`, `onLongPress`, `onPressIn`, `onPressOut`) so the engine skips the node during touch hit-testing, matching React Native and Flow B behavior.
 
 ## [0.17.0] - 2026-10-15
 ### Added
