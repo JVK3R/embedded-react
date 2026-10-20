@@ -450,8 +450,8 @@ describe('declared style keys', () => {
     ],
     ['color', "<View style={{color: '#fff'}} />", 'View'],
     [
-      'borderRadius',
-      '<Image source="logo" style={{borderRadius: 4}} />',
+      'borderWidth',
+      '<Image source="logo" style={{borderWidth: 4}} />',
       'Image',
     ],
     ['fontSize', '<Switch style={{fontSize: 4}} />', 'Switch'],
@@ -717,6 +717,14 @@ describe('values a declared prop cannot lower', () => {
     expect(gen(`<Pressable disabled onPress=${HANDLER} />`)).not.toContain(
       'ER_EVENT_PRESS',
     );
+  });
+
+  it('rounds an <Image> with its corner radii, as Flow A does', () => {
+    const c = gen(
+      '<Image source="logo" style={{borderRadius: 12, borderTopLeftRadius: 4}} />',
+    );
+    expect(c).toContain('p.border_radius = 12;');
+    expect(c).toContain('p.border_top_left_radius = 4;');
   });
 
   it('tints an <ActivityIndicator> from style.color, as Flow A does', () => {

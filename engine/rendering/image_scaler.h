@@ -29,12 +29,17 @@
  * The image is looked up in the image registry by name. If not found, nothing is drawn.
  * Scaling mode and tint color are taken from props.
  *
- * @param[in] props  Image node props carrying the asset name, resize_mode, and tint_color.
+ * When props carries a corner radius and @p box is given, the bitmap is clipped to the rounded rect
+ * @p box describes, with the same anti-aliased edge a background with those radii is filled with.
+ * Rows no corner arc cuts into take the same paths a square image does.
+ *
+ * @param[in] props  Image node props carrying the asset name, resize_mode, tint_color and corner radii.
  * @param[in] x     Destination left edge in framebuffer pixels.
  * @param[in] y     Destination top edge in framebuffer pixels.
  * @param[in] w     Destination width in pixels.
  * @param[in] h     Destination height in pixels.
+ * @param[in] box   The node's border box, which the corner radii round; NULL draws square corners.
  */
-void er_image_render(const ERImageProps* props, int x, int y, int w, int h);
+void er_image_render(const ERImageProps* props, int x, int y, int w, int h, const ERRect* box);
 
 #endif

@@ -330,7 +330,7 @@ void er_arc_render(ERNode* n, int px, int py, int w, int h)
                 memset(&ip, 0, sizeof(ip));
                 memcpy(ip.image_name, p->image_name, sizeof(ip.image_name));
                 ip.resize_mode = ER_RESIZE_CONTAIN;
-                er_image_render(&ip, kx0, ky0, ks, ks);
+                er_image_render(&ip, kx0, ky0, ks, ks, NULL);
             }
         }
     }

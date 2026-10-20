@@ -12,6 +12,10 @@ See [Releasing](https://embedded-react.dev/internals/releasing) for the release 
 ## [Unreleased]
 ### Fixed
 
+- An `<Image>` with `borderRadius` or per-corner radii clips its bitmap to the rounded corners, with the
+  same anti-aliased edge a background with those radii has. It used to draw square corners, so a rounded
+  cover image, or `borderRadius` in an `<ImageBackground>`'s `imageStyle`, had no effect. Flow B accepts
+  the radius keys on `<Image>`; it used to reject them with an `AOT:` error.
 - In Flow A (QuickJS), `<Pressable disabled>` now withholds its press event handlers (`onPress`, `onLongPress`, `onPressIn`, `onPressOut`) so the engine skips the node during touch hit-testing, matching React Native and Flow B behavior.
 - An `.svg` gradient coordinate that does not parse (`x1="abc"`) now takes its SVG default instead of
   being drawn as 0, so a bad `x2` no longer collapses the gradient to a flat color.

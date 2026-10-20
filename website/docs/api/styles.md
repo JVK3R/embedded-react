@@ -47,7 +47,8 @@ The [Layout](../concepts/layout.md) page explains the solver and where it differ
 
 `borderRadius` and the four per-corner radii; `borderWidth` and the four per-side widths;
 `borderColor` and the four per-side colours; `borderStyle` (`solid`, `dashed`, `dotted`). Radius
-edges are anti-aliased (`ERUI_BORDER_AA`).
+edges are anti-aliased (`ERUI_BORDER_AA`). On an `Image` the radii clip the bitmap to the same
+rounded edge; an `Image` draws no border.
 
 ## Transform
 
@@ -117,7 +118,8 @@ border widths and colors, the shadow keys and `elevation`, `transformOrigin`, `f
 It also rejects a key the engine does not draw on that element, which Flow A ignores without a word.
 The layout keys and `transform` work everywhere. `backgroundColor`, the borders and `opacity` work on
 `View`, `ScrollView`, `Pressable`, `TouchableOpacity` and `Modal`, and on `TextInput` without the
-per-corner radii. `color`, `fontSize`, `fontWeight`, `lineHeight` and `letterSpacing` work on `Text`;
+per-corner radii. `borderRadius` and the per-corner radii work on `Image`. `color`, `fontSize`,
+`fontWeight`, `lineHeight` and `letterSpacing` work on `Text`;
 `TextInput` takes `color` and `fontSize`, and `ActivityIndicator` takes `color` as its tint. A nested
 `<Text>` span takes `color`, `fontSize`, `fontWeight` and `letterSpacing` only.
 

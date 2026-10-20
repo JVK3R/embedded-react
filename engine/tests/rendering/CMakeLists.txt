@@ -8,6 +8,10 @@ add_executable(test_image test_image.c)
 target_link_libraries(test_image PRIVATE embedded-react)
 add_test(NAME rendering_image COMMAND test_image)
 
+add_executable(test_image_radius test_image_radius.c)
+target_link_libraries(test_image_radius PRIVATE embedded-react)
+add_test(NAME rendering_image_radius COMMAND test_image_radius)
+
 add_executable(test_opacity test_opacity.c)
 target_link_libraries(test_opacity PRIVATE embedded-react)
 add_test(NAME rendering_opacity COMMAND test_opacity)

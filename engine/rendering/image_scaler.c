@@ -18,12 +18,39 @@
 #include "er_limits.h"
 #include "image_registry.h"
 #include "renderer_internal.h"
+#include "rrect.h"
 #include <math.h>
 #include <stddef.h>
 
 /*----------------------------------------------------------------------------------------------------------------------
+ - Types: Private
+ ---------------------------------------------------------------------------------------------------------------------*/
+
+/**
+ * @brief The rounded-rect silhouette an image's rows are clipped to.
+ *
+ * The node's border box with its radii clamped exactly as a background fill clamps them, so the bitmap
+ * stops at the edge a background_color with the same radii would have.
+ */
+typedef struct
+{
+    int x;        /**< Box left edge in framebuffer pixels. */
+    int y;        /**< Box top edge in framebuffer pixels. */
+    int w;        /**< Box width — the coordinate space of the row spans. */
+    int h;        /**< Box height. */
+    int r_tl;     /**< Clamped corner radii. */
+    int r_tr;     /**< @see r_tl */
+    int r_br;     /**< @see r_tl */
+    int r_bl;     /**< @see r_tl */
+    bool rounded; /**< False when every radius is 0 or there is no box: rows blit whole, as before. */
+} ImgMask;
+
+/*----------------------------------------------------------------------------------------------------------------------
  - Variables: Private
  ---------------------------------------------------------------------------------------------------------------------*/
+
+/** @brief A mask that clips nothing, for the paths that emit rows the mask has already let through whole. */
+static const ImgMask k_square_mask = {0, 0, 0, 0, 0, 0, 0, 0, false};
 
 /** @brief Single-row scratch buffer used when nearest-neighbor scaling is required. */
 /* One assembled row per render worker: cheap enough to duplicate, and it keeps image
@@ -196,6 +223,219 @@ static bool visible_part(int x, int y, int w, int h, int* x0, int* y0, int* x1, 
 }
 
 /**
+ * @brief Resolves an Image node's corner radii into the mask its rows are clipped to.
+ *
+ * @param[out] m      Receives the silhouette.
+ * @param[in]  props  Image props carrying the resolved per-corner radii.
+ * @param[in]  box    The node's border box; NULL leaves the mask square.
+ */
+static void mask_init(ImgMask* m, const ERImageProps* props, const ERRect* box)
+{
+    *m = k_square_mask;
+    if (!box)
+        return;
+    m->x = box->x;
+    m->y = box->y;
+    m->w = box->w;
+    m->h = box->h;
+    m->r_tl = props->border_tl_radius;
+    m->r_tr = props->border_tr_radius;
+    m->r_br = props->border_br_radius;
+    m->r_bl = props->border_bl_radius;
+    er_rrect_clamp_radii(m->w, m->h, &m->r_tl, &m->r_tr, &m->r_br, &m->r_bl);
+    m->rounded = (m->r_tl > 0 || m->r_tr > 0 || m->r_br > 0 || m->r_bl > 0);
+}
+
+/**
+ * @brief Finds the destination rows no corner arc cuts into, which can go out unclipped.
+ *
+ * @param[in]  m       Silhouette the rows are clipped to.
+ * @param[in]  dst_y   Destination top edge in framebuffer pixels.
+ * @param[in]  dst_h   Destination height in pixels.
+ * @param[out] band0   First straight row, relative to dst_y.
+ * @param[out] band1   One past the last straight row, relative to dst_y; equal to band0 when there is none.
+ */
+static void mask_straight_rows(const ImgMask* m, int dst_y, int dst_h, int* band0, int* band1)
+{
+    *band0 = 0;
+    *band1 = dst_h;
+    if (!m->rounded)
+        return;
+    const int top = (m->r_tl > m->r_tr) ? m->r_tl : m->r_tr;
+    const int bottom = (m->r_bl > m->r_br) ? m->r_bl : m->r_br;
+    if (m->y + top - dst_y > *band0)
+        *band0 = m->y + top - dst_y;
+    if (m->y + m->h - bottom - dst_y < *band1)
+        *band1 = m->y + m->h - bottom - dst_y;
+    if (*band1 < *band0)
+        *band1 = *band0;
+}
+
+/**
+ * @brief Emits a run of premultiplied pixels, copied when the image is opaque and blended otherwise.
+ *
+ * @param[in] px      Premultiplied ARGB8888 pixels.
+ * @param[in] opaque  Whether every pixel's alpha is 0xFF.
+ * @param[in] x       Destination left edge in framebuffer pixels.
+ * @param[in] y       Destination row in framebuffer pixels.
+ * @param[in] n       Pixel count.
+ */
+static void emit_span(const uint32_t* px, bool opaque, int x, int y, int n)
+{
+    if (opaque)
+        er_blit_copy(px, n * (int)sizeof(uint32_t), x, y, n, 1);
+    else
+        er_blit_blend(px, n * (int)sizeof(uint32_t), 255, x, y, n, 1);
+}
+
+/**
+ * @brief Emits one destination row of image pixels, clipped to the rounded-rect silhouette.
+ *
+ * A square mask emits the row whole. Otherwise only the row's covered span goes out, then the
+ * anti-aliased fringe pixels beside it, faded by the arc's coverage (the walk er_rrect_fill_corners
+ * fills a background's corner with, so the image's corner is the same shape).
+ *
+ * @param[in] m       Silhouette to clip to.
+ * @param[in] row     Premultiplied ARGB8888 pixels for destination columns [x, x + n).
+ * @param[in] opaque  Whether every pixel in @p row has alpha 0xFF.
+ * @param[in] x       Destination left edge of @p row in framebuffer pixels.
+ * @param[in] y       Destination row in framebuffer pixels.
+ * @param[in] n       Pixel count.
+ */
+static void emit_row(const ImgMask* m, const uint32_t* row, bool opaque, int x, int y, int n)
+{
+    if (n <= 0)
+        return;
+    if (!m->rounded)
+    {
+        emit_span(row, opaque, x, y, n);
+        return;
+    }
+    if (y < m->y || y >= m->y + m->h)
+        return;
+
+    ERRRectRow rr;
+    er_rrect_row(m->w, m->h, m->r_tl, m->r_tr, m->r_br, m->r_bl, y - m->y, &rr);
+
+    int s0 = m->x + rr.x0;
+    int s1 = m->x + rr.x1;
+    if (s0 < x)
+        s0 = x;
+    if (s1 > x + n)
+        s1 = x + n;
+    if (s1 > s0)
+        emit_span(&row[s0 - x], opaque, s0, y, s1 - s0);
+
+#if ERUI_BORDER_AA
+    for (int k = 0, kmax = er_rrect_fringe_max(rr.l_r); k < kmax; k++)
+    {
+        const float cov = er_rrect_fringe_cov(rr.l_r, rr.l_dx, rr.l_dy, k);
+        if (cov <= 0.0f)
+            break;
+        const int ax = m->x + rr.x0 - 1 - k;
+        if (cov < 1.0f && ax >= m->x && ax >= x && ax < x + n)
+        {
+            const uint32_t p = er_px_scale_premul(row[ax - x], (uint32_t)(cov * 255.0f + 0.5f));
+            er_blit_blend(&p, (int)sizeof(uint32_t), 255, ax, y, 1, 1);
+        }
+    }
+    for (int k = 0, kmax = er_rrect_fringe_max(rr.r_r); k < kmax; k++)
+    {
+        const float cov = er_rrect_fringe_cov(rr.r_r, rr.r_dx, rr.r_dy, k);
+        if (cov <= 0.0f)
+            break;
+        const int ax = m->x + rr.x1 + k;
+        if (cov < 1.0f && ax < m->x + m->w && ax >= x && ax < x + n)
+        {
+            const uint32_t p = er_px_scale_premul(row[ax - x], (uint32_t)(cov * 255.0f + 0.5f));
+            er_blit_blend(&p, (int)sizeof(uint32_t), 255, ax, y, 1, 1);
+        }
+    }
+#endif
+}
+
+/**
+ * @brief Emits columns [vx0, vx1) of one source row at 1:1, through the mask.
+ *
+ * ARGB rows go out straight from the source buffer; RGB565 rows are expanded into the row scratch
+ * buffer first, chunked so widths beyond its capacity still render fully.
+ *
+ * @param[in] img    Source image entry.
+ * @param[in] m      Silhouette to clip to.
+ * @param[in] src_x  Source column drawn at dst_x.
+ * @param[in] sy     Source row.
+ * @param[in] dst_x  Destination left edge in framebuffer pixels.
+ * @param[in] y      Destination row in framebuffer pixels.
+ * @param[in] vx0    First column to emit, relative to dst_x.
+ * @param[in] vx1    One past the last column to emit, relative to dst_x.
+ */
+static void
+emit_unscaled_row(const ImageEntry* img, const ImgMask* m, int src_x, int sy, int dst_x, int y, int vx0, int vx1)
+{
+    if (img->format == ER_IMG_ARGB8888)
+    {
+        const uint32_t* srow = (const uint32_t*)img->buf + (size_t)sy * (size_t)img->w + (size_t)src_x;
+        emit_row(m, srow + vx0, img->opaque, dst_x + vx0, y, vx1 - vx0);
+        return;
+    }
+    const uint16_t* srow = (const uint16_t*)img->buf + (size_t)sy * (size_t)img->w + (size_t)src_x;
+    for (int cx = vx0; cx < vx1; cx += ERUI_MAX_IMG_ROW_PIXELS)
+    {
+        const int cw = (vx1 - cx) < ERUI_MAX_IMG_ROW_PIXELS ? (vx1 - cx) : ERUI_MAX_IMG_ROW_PIXELS;
+        for (int dx = 0; dx < cw; dx++)
+            irow()[dx] = rgb565_to_argb(srow[cx + dx]);
+        emit_row(m, irow(), true, dst_x + cx, y, cw);
+    }
+}
+
+/**
+ * @brief Renders a source crop at 1:1 with no tint, as one whole-rect transfer where the backend can take it.
+ *
+ * @param[in] img    Source image entry.
+ * @param[in] src_x  Left edge of the source crop.
+ * @param[in] src_y  Top edge of the source crop.
+ * @param[in] dst_x  Destination left edge in framebuffer pixels.
+ * @param[in] dst_y  Destination top edge in framebuffer pixels.
+ * @param[in] w      Width in pixels, the same in source and destination.
+ * @param[in] h      Height in pixels, the same in source and destination.
+ */
+static void render_unscaled(const ImageEntry* img, int src_x, int src_y, int dst_x, int dst_y, int w, int h)
+{
+    if (img->format == ER_IMG_ARGB8888)
+    {
+        /* Emit directly from the source buffer rows using the image's own row stride. An opaque
+         * image goes through the format-aware entry point: with a copy_rect_fmt backend that is
+         * one whole-rect call carrying the engine's opacity guarantee (no per-pixel alpha scan
+         * backend-side); otherwise it degrades to the classic er_blit_copy. */
+        const int img_stride = img->w * (int)sizeof(uint32_t);
+        const uint32_t* rows = (const uint32_t*)img->buf + (size_t)src_y * (size_t)img->w + (size_t)src_x;
+        if (img->opaque)
+            er_blit_copy_fmt(rows, img_stride, ER_IMG_ARGB8888, dst_x, dst_y, w, h);
+        else
+            er_blit_blend(rows, img_stride, 255, dst_x, dst_y, w, h);
+        return;
+    }
+
+    /* RGB565 1:1: hand the 16-bit rows straight to the backend when it can take them — one
+     * whole-rect transfer (a single M2M_PFC on DMA2D-class hardware), the same one-shot cost
+     * as the ARGB path. A full-screen background must NOT decay into per-row CPU expansion:
+     * that is ~1M conversions plus one backend call per scanline. */
+    const int stride565 = img->w * (int)sizeof(uint16_t);
+    const uint16_t* rows565 = (const uint16_t*)img->buf + (size_t)src_y * (size_t)img->w + (size_t)src_x;
+    if (er_blit_copy_fmt(rows565, stride565, ER_IMG_RGB565, dst_x, dst_y, w, h))
+        return;
+
+    /* CPU fallback (no copy_rect_fmt backend, scratch capture, or inherited alpha): expand each
+     * row into the scratch buffer (internal RAM — reads from the 2 B/px source are the only
+     * external-memory source traffic), then emit it. */
+    int vx0, vy0, vx1, vy1;
+    if (!visible_part(dst_x, dst_y, w, h, &vx0, &vy0, &vx1, &vy1))
+        return;
+    for (int dy = vy0; dy < vy1; dy++)
+        emit_unscaled_row(img, &k_square_mask, src_x, src_y + dy, dst_x, dst_y + dy, vx0, vx1);
+}
+
+/**
  * @brief Renders a source crop of an image to a destination rectangle.
  *
  * Uses bilinear sampling when ERUI_BILINEAR_SCALE is non-zero, otherwise nearest-neighbor.
@@ -209,7 +449,11 @@ static bool visible_part(int x, int y, int w, int h, int* x0, int* y0, int* x1, 
  *
  * The CPU paths produce only the rows and columns inside the active scissor (see visible_part()).
  *
+ * A rounded mask clips every row a corner arc cuts into; at 1:1 the rows between the arcs still go
+ * out as one whole-rect transfer.
+ *
  * @param[in] img         Source image entry (buffer, dimensions, format, opacity).
+ * @param[in] m           Silhouette the destination rows are clipped to.
  * @param[in] src_x       Left edge of the source crop rectangle.
  * @param[in] src_y       Top edge of the source crop rectangle.
  * @param[in] src_w       Width of the source crop rectangle.
@@ -224,6 +468,7 @@ static bool visible_part(int x, int y, int w, int h, int* x0, int* y0, int* x1, 
  * @param[in] tb          Tint blue channel.
  */
 static void render_region(const ImageEntry* img,
+                          const ImgMask* m,
                           int src_x,
                           int src_y,
                           int src_w,
@@ -243,47 +488,22 @@ static void render_region(const ImageEntry* img,
     /* Fast path: source and destination regions are the same size and no tint is needed. */
     if (!has_tint && src_w == dst_w && src_h == dst_h)
     {
-        if (img->format == ER_IMG_ARGB8888)
-        {
-            /* Emit directly from the source buffer rows using the image's own row stride. An opaque
-             * image goes through the format-aware entry point: with a copy_rect_fmt backend that is
-             * one whole-rect call carrying the engine's opacity guarantee (no per-pixel alpha scan
-             * backend-side); otherwise it degrades to the classic er_blit_copy. */
-            const int img_stride = img->w * (int)sizeof(uint32_t);
-            const uint32_t* rows = (const uint32_t*)img->buf + (size_t)src_y * (size_t)img->w + (size_t)src_x;
-            if (img->opaque)
-                er_blit_copy_fmt(rows, img_stride, ER_IMG_ARGB8888, dst_x, dst_y, dst_w, dst_h);
-            else
-                er_blit_blend(rows, img_stride, 255, dst_x, dst_y, dst_w, dst_h);
-            return;
-        }
-
-        /* RGB565 1:1: hand the 16-bit rows straight to the backend when it can take them — one
-         * whole-rect transfer (a single M2M_PFC on DMA2D-class hardware), the same one-shot cost
-         * as the ARGB path. A full-screen background must NOT decay into per-row CPU expansion:
-         * that is ~1M conversions plus one backend call per scanline. */
-        const int stride565 = img->w * (int)sizeof(uint16_t);
-        const uint16_t* rows565 = (const uint16_t*)img->buf + (size_t)src_y * (size_t)img->w + (size_t)src_x;
-        if (er_blit_copy_fmt(rows565, stride565, ER_IMG_RGB565, dst_x, dst_y, dst_w, dst_h))
+        /* The rows between the corner arcs keep the whole-rect transfer; only the arc rows go row by row. */
+        int band0, band1;
+        mask_straight_rows(m, dst_y, dst_h, &band0, &band1);
+        if (band1 > band0)
+            render_unscaled(img, src_x, src_y + band0, dst_x, dst_y + band0, dst_w, band1 - band0);
+        if (band0 == 0 && band1 == dst_h)
             return;
 
-        /* CPU fallback (no copy_rect_fmt backend, scratch capture, or inherited alpha): expand each
-         * row into the scratch buffer (internal RAM — reads from the 2 B/px source are the only
-         * external-memory source traffic), then emit it. Chunked horizontally so widths beyond the
-         * scratch capacity still render fully. */
         int vx0, vy0, vx1, vy1;
         if (!visible_part(dst_x, dst_y, dst_w, dst_h, &vx0, &vy0, &vx1, &vy1))
             return;
         for (int dy = vy0; dy < vy1; dy++)
         {
-            const uint16_t* srow = rows565 + (size_t)dy * (size_t)img->w;
-            for (int cx = vx0; cx < vx1; cx += ERUI_MAX_IMG_ROW_PIXELS)
-            {
-                const int cw = (vx1 - cx) < ERUI_MAX_IMG_ROW_PIXELS ? (vx1 - cx) : ERUI_MAX_IMG_ROW_PIXELS;
-                for (int dx = 0; dx < cw; dx++)
-                    irow()[dx] = rgb565_to_argb(srow[cx + dx]);
-                er_blit_copy(irow(), cw * (int)sizeof(uint32_t), dst_x + cx, dst_y + dy, cw, 1);
-            }
+            if (dy >= band0 && dy < band1)
+                continue;
+            emit_unscaled_row(img, m, src_x, src_y + dy, dst_x, dst_y + dy, vx0, vx1);
         }
         return;
     }
@@ -315,10 +535,7 @@ static void render_region(const ImageEntry* img,
             irow()[dx - vx0] = p;
         }
         /* Tint preserves alpha, so an opaque image stays opaque through every branch above. */
-        if (img->opaque)
-            er_blit_copy(irow(), vis_w * (int)sizeof(uint32_t), dst_x + vx0, dst_y + dy, vis_w, 1);
-        else
-            er_blit_blend(irow(), vis_w * (int)sizeof(uint32_t), 255, dst_x + vx0, dst_y + dy, vis_w, 1);
+        emit_row(m, irow(), img->opaque, dst_x + vx0, dst_y + dy, vis_w);
     }
 }
 
@@ -336,7 +553,7 @@ void er_image_load_rgb565(const char* name, const void* rgb565_buf, int w, int h
     image_registry_store(name, rgb565_buf, w, h, ER_IMG_RGB565);
 }
 
-void er_image_render(const ERImageProps* props, int x, int y, int w, int h)
+void er_image_render(const ERImageProps* props, int x, int y, int w, int h, const ERRect* box)
 {
     if (!props || w <= 0 || h <= 0)
         return;
@@ -344,6 +561,9 @@ void er_image_render(const ERImageProps* props, int x, int y, int w, int h)
     const ImageEntry* img = image_registry_get(props->image_name);
     if (!img || img->w <= 0 || img->h <= 0)
         return;
+
+    ImgMask mask;
+    mask_init(&mask, props, box);
 
     const uint32_t tint = props->tint_color;
     const bool has_tint = (tint != 0u);
@@ -355,7 +575,7 @@ void er_image_render(const ERImageProps* props, int x, int y, int w, int h)
     {
         default:
         case ER_RESIZE_STRETCH:
-            render_region(img, 0, 0, img->w, img->h, x, y, w, h, has_tint, tr, tg, tb);
+            render_region(img, &mask, 0, 0, img->w, img->h, x, y, w, h, has_tint, tr, tg, tb);
             break;
 
         case ER_RESIZE_COVER:
@@ -378,7 +598,7 @@ void er_image_render(const ERImageProps* props, int x, int y, int w, int h)
                 crop_h = 1;
             const int crop_x = (img->w - crop_w) / 2;
             const int crop_y = (img->h - crop_h) / 2;
-            render_region(img, crop_x, crop_y, crop_w, crop_h, x, y, w, h, has_tint, tr, tg, tb);
+            render_region(img, &mask, crop_x, crop_y, crop_w, crop_h, x, y, w, h, has_tint, tr, tg, tb);
             break;
         }
 
@@ -402,7 +622,8 @@ void er_image_render(const ERImageProps* props, int x, int y, int w, int h)
                 scaled_h = 1;
             const int off_x = (w - scaled_w) / 2;
             const int off_y = (h - scaled_h) / 2;
-            render_region(img, 0, 0, img->w, img->h, x + off_x, y + off_y, scaled_w, scaled_h, has_tint, tr, tg, tb);
+            render_region(
+                img, &mask, 0, 0, img->w, img->h, x + off_x, y + off_y, scaled_w, scaled_h, has_tint, tr, tg, tb);
             break;
         }
 
@@ -415,7 +636,8 @@ void er_image_render(const ERImageProps* props, int x, int y, int w, int h)
             const int vis_h = (img->h < h) ? img->h : h;
             const int off_x = (img->w < w) ? (w - img->w) / 2 : 0;
             const int off_y = (img->h < h) ? (h - img->h) / 2 : 0;
-            render_region(img, src_x, src_y, vis_w, vis_h, x + off_x, y + off_y, vis_w, vis_h, has_tint, tr, tg, tb);
+            render_region(
+                img, &mask, src_x, src_y, vis_w, vis_h, x + off_x, y + off_y, vis_w, vis_h, has_tint, tr, tg, tb);
             break;
         }
 
@@ -428,7 +650,8 @@ void er_image_render(const ERImageProps* props, int x, int y, int w, int h)
                 for (int tx = 0; tx < w; tx += img->w)
                 {
                     const int tile_w = (tx + img->w <= w) ? img->w : (w - tx);
-                    render_region(img, 0, 0, tile_w, tile_h, x + tx, y + ty, tile_w, tile_h, has_tint, tr, tg, tb);
+                    render_region(
+                        img, &mask, 0, 0, tile_w, tile_h, x + tx, y + ty, tile_w, tile_h, has_tint, tr, tg, tb);
                 }
             }
             break;

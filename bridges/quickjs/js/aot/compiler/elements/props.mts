@@ -121,6 +121,15 @@ const VIEW_STYLE = [
   'opacity',
 ];
 
+/** What the engine draws an Image with, beyond its props: the corners its bitmap is clipped to. */
+const IMAGE_STYLE = [
+  'borderRadius',
+  'borderTopLeftRadius',
+  'borderTopRightRadius',
+  'borderBottomRightRadius',
+  'borderBottomLeftRadius',
+];
+
 /** What the engine draws a Text with. */
 const TEXT_STYLE = [
   'color',
@@ -235,7 +244,7 @@ const ELEMENTS: Record<string, ElementSpec> = {
   Image: element(
     'Image',
     [...HOST_PROPS, 'source', 'imageName', 'resizeMode', 'tintColor'],
-    LAYOUT_STYLE,
+    [...LAYOUT_STYLE, ...IMAGE_STYLE],
     'none',
   ),
   Switch: element(

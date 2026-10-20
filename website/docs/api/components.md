@@ -81,6 +81,10 @@ import logo from './assets/logo.png';
 An image must be baked into the app; see [Assets](../concepts/assets.md). An opaque image, or one
 baked as RGB565, is drawn through the engine's copy fast path with no per-pixel blending.
 
+`borderRadius` and the per-corner radii clip the bitmap to the rounded edge a background with those
+radii fills, anti-aliased the same way. The clip is the node's border box, so padding moves the
+picture inward without moving the corners.
+
 ## Pressable
 
 ```jsx

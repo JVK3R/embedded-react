@@ -2624,10 +2624,12 @@ static ER_NOINLINE void paint_node(ERNode* n, int px, int py, int w, int h)
              * the box within border + padding. er_image_render() is entirely destination-rect
              * relative, so every resizeMode follows from insetting the rect alone: `cover` and
              * `contain` fit the CONTENT box, and `repeat` tiles from the content origin — which is
-             * what `background-origin: padding-box`, the CSS default, does. */
+             * what `background-origin: padding-box`, the CSS default, does. The corner radii clip
+             * it to the border box, the silhouette a background with those radii would fill. */
             int ix = px, iy = py, iw = w, ih = h;
             er_layout_content_box(&n->layout, &ix, &iy, &iw, &ih);
-            er_image_render(&n->props.image, ix, iy, iw, ih);
+            const ERRect box = {px, py, w, h};
+            er_image_render(&n->props.image, ix, iy, iw, ih, &box);
             break;
         }
         case ER_NODE_VECTOR:
@@ -3521,6 +3523,14 @@ void er_node_set_props(ERNode* node, const ERProps* props)
             node->props.image.image_name[ER_IMAGE_NAME_MAX] = '\0';
             node->props.image.resize_mode = props->resize_mode;
             node->props.image.tint_color = props->tint_color;
+            node->props.image.border_tl_radius =
+                props->border_top_left_radius > 0 ? props->border_top_left_radius : props->border_radius;
+            node->props.image.border_tr_radius =
+                props->border_top_right_radius > 0 ? props->border_top_right_radius : props->border_radius;
+            node->props.image.border_br_radius =
+                props->border_bottom_right_radius > 0 ? props->border_bottom_right_radius : props->border_radius;
+            node->props.image.border_bl_radius =
+                props->border_bottom_left_radius > 0 ? props->border_bottom_left_radius : props->border_radius;
             break;
         case ER_NODE_ACTIVITY_INDICATOR:
         {
