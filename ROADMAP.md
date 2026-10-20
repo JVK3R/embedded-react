@@ -134,7 +134,10 @@ Carried over from the C output:
 ### Open API decisions
 
 - **Gradient style key.** Gradients are an engine primitive with no React Native prop;
-  pick a custom style key (`experimental_gradient`?) and shape for app authors.
+  the key is `backgroundGradient`
+  ([#108](https://github.com/TheMasterCoder007/embedded-react/issues/108)). Still open: its
+  shape, `{colors, angle?, positions?}` or the CSS-modelled `{type, angle?, to?, stops}`
+  recorded on #108.
 - **Non-native-driver animation.** Decide whether to support `Animated` without
   `useNativeDriver` (needs a JS-side rAF loop calling `setValue` each frame) or require
   `useNativeDriver: true`.
@@ -173,7 +176,8 @@ highest-impact first.
 - **Cache blurred shadow buffers** keyed on geometry (shadows are fully re-blurred every
   repaint).
 - **Gradient color LUT.** Precompute a 256-entry premultiplied LUT from the stops instead
-  of evaluating per pixel.
+  of evaluating per pixel, and rasterize only the rows and columns inside the clip
+  (`render_linear()` evaluates the whole box even for a small damage rect).
 - **Cache / DDA-step scaled images** instead of re-sampling (per-pixel division) every
   repaint.
 - **Resolve `BitmapFont*` once** when text props are set and cache on the node (currently
@@ -196,6 +200,11 @@ highest-impact first.
   momentum) with a small active-scroller list.
 - **Reduce static scratch RAM:** size slots to the largest composited node, tile large
   transformed/opacity subtrees, or share one arena across transform/opacity/shadow.
+- **Scroll by moving painted pixels** (deferred,
+  [#292](https://github.com/TheMasterCoder007/embedded-react/issues/292)). Every scroll step
+  repaints the whole viewport. Moving the painted viewport by the delta and repainting only
+  the exposed strip needs a backend "move rect" operation and a full framebuffer, so it
+  would be opt-in for backends that have both (ESP32-S3 RGB, STM32 LTDC/DMA2D).
 
 ---
 
@@ -230,6 +239,9 @@ Deliberately out of scope:
 - **Display initialization** (SPI, MIPI DSI, LTDC) — the backend's responsibility.
 - **Network / fetch** — provided by the firmware if needed.
 - **Web-only React APIs** — DOM refs, portals, Suspense, Server Components.
+- **Host-only optimizations** — SIMD paths (AVX2, NEON on desktop) in the `software`
+  backend. On x86 and desktop it is the simulator, not a target; optimized loops belong in
+  the backend of the board that runs them.
 - **List virtualization** — `FlatList` windowing, or a native recycling list node.
   `FlatList` is a documented `ScrollView` alias in both flows: every row mounts and stays
   mounted (see [FlatList](https://embedded-react.dev/api/components#flatlist)). Windowing in JS would cost a
