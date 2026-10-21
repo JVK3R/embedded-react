@@ -26,6 +26,8 @@
  *   - partial: only the siblings BELOW the cover are skipped, the ones above still paint,
  *   - flags retire: a buried node that changed does not re-damage the same pixels forever, and a
  *     TRANSFORMED sibling is never buried at all (it has no box-shaped footprint to record),
+ *   - a translated node buried inside a clipping container still records its translated box, and a
+ *     rotated one keeps the container from being buried at all,
  *   - pixel equivalence: the culled frame is byte-identical to one rendered with everything drawn.
  *
  * The assertions that a layer WAS skipped are the only ones gated on ERUI_OCCLUSION_CULLING; every
@@ -119,29 +121,47 @@ static void fb_fill(uint32_t argb, int x, int y, int w, int h, void* ctx)
  - Helpers
  ---------------------------------------------------------------------------------------------------------------------*/
 
+/**
+ * @brief Source-over composites premultiplied pixels, scaled by a global alpha, into the framebuffer.
+ *
+ * Real compositing rather than a counter, so a transformed node — which reaches the panel only through
+ * copy/blend — lands in s_fb and a pixel comparison can see where it was left.
+ */
+static void fb_composite(const void* src, int stride, uint32_t alpha, int x, int y, int w, int h)
+{
+    s_op_count++;
+    for (int row = 0; row < h; row++)
+    {
+        const uint32_t* sp = (const uint32_t*)((const uint8_t*)src + (size_t)row * (size_t)stride);
+        for (int col = 0; col < w; col++)
+        {
+            const int dx = x + col, dy = y + row;
+            if (dx < 0 || dx >= SCREEN || dy < 0 || dy >= SCREEN)
+                continue;
+            const uint32_t p = sp[col];
+            const uint32_t sa = div255(((p >> 24) & 0xFFU) * alpha);
+            if (sa == 0U)
+                continue;
+            const uint32_t inv = 255U - sa;
+            uint32_t* d = &s_fb[dy * SCREEN + dx];
+            const uint32_t dr = (*d >> 16) & 0xFFU, dg = (*d >> 8) & 0xFFU, db = *d & 0xFFU;
+            *d = 0xFF000000U | ((div255(((p >> 16) & 0xFFU) * alpha) + div255(dr * inv)) << 16)
+                 | ((div255(((p >> 8) & 0xFFU) * alpha) + div255(dg * inv)) << 8)
+                 | (div255((p & 0xFFU) * alpha) + div255(db * inv));
+        }
+    }
+}
+
 static void fb_copy(const void* src, int stride, int x, int y, int w, int h, void* ctx)
 {
-    (void)src;
-    (void)stride;
-    (void)x;
-    (void)y;
-    (void)w;
-    (void)h;
     (void)ctx;
-    s_op_count++;
+    fb_composite(src, stride, 255U, x, y, w, h);
 }
 
 static void fb_blend(const void* src, int stride, uint8_t alpha, int x, int y, int w, int h, void* ctx)
 {
-    (void)src;
-    (void)stride;
-    (void)alpha;
-    (void)x;
-    (void)y;
-    (void)w;
-    (void)h;
     (void)ctx;
-    s_op_count++;
+    fb_composite(src, stride, alpha, x, y, w, h);
 }
 
 static ERProps props_default(void)
@@ -439,6 +459,264 @@ static int check_transformed_sibling_not_buried(void)
 }
 #endif
 
+/**
+ * @brief Slides a pill along a clipping bar under an opaque panel, then compares the frame with a full repaint.
+ *
+ * The scene from issues #312 and #369: a bar that clips, a pill sliding in from the right, and an opaque panel
+ * at the bar's right end, painted after it, whose child changes between the moves. Every other commit repaints
+ * only that child, so the panel covers the whole damage region and the cull can bury the bar.
+ *
+ * @param[in] rotate_z  The pill's rotation in degrees; 0 leaves it translate-only.
+ * @param[in] animated  Drive every change through animated values instead of props, so no commit after the
+ *                      first runs a layout pass: the pill is laid out translate-only and the rotation, the
+ *                      slide and the blink (an opacity toggle) all arrive on the native driver.
+ *
+ * @return true when the settled frame matches a full repaint of the same scene.
+ */
+static bool slide_under_cover_matches_full_repaint(float rotate_z, bool animated)
+{
+    static uint32_t reference[SCREEN * SCREEN];
+    er_reset();
+
+    ERNode* root = er_node_create(ER_NODE_VIEW);
+    ERProps rp = box(0, 0, SCREEN, SCREEN, C_ROOT);
+    rp.position = ER_POS_RELATIVE;
+    er_node_set_props(root, &rp);
+
+    ERNode* bar = er_node_create(ER_NODE_VIEW);
+    ERProps bp = box(0, 0, SCREEN, 40, 0U);
+    bp.overflow = ER_OVERFLOW_HIDDEN;
+    er_node_set_props(bar, &bp);
+
+    ERNode* pill = er_node_create(ER_NODE_VIEW);
+    ERProps pp = box(0, 10, 40, 20, C_DEEP);
+    pp.transform_translate_x = 140.0f;
+    pp.transform_rotate_z = animated ? 0.0f : rotate_z;
+    er_node_set_props(pill, &pp);
+    er_tree_append_child(bar, pill);
+
+    ERNode* panel = er_node_create(ER_NODE_VIEW);
+    ERProps np = box(150, 0, 50, 40, C_COVER);
+    er_node_set_props(panel, &np);
+
+    ERNode* blink = er_node_create(ER_NODE_VIEW);
+    ERProps kp = box(20, 15, 10, 10, C_TOP);
+    er_node_set_props(blink, &kp);
+    er_tree_append_child(panel, blink);
+
+    er_tree_append_child(root, bar);
+    er_tree_append_child(root, panel); /* painted after the bar: covers the damage whenever only `blink` repaints */
+    er_tree_set_root(root);
+
+    full_frame();
+
+    ERAnimValueHandle slide = er_anim_value_create(140.0f);
+    ERAnimValueHandle spin = er_anim_value_create(0.0f);
+    ERAnimValueHandle fade = er_anim_value_create(1.0f);
+    if (animated)
+    {
+        er_anim_value_bind(slide, pill, ER_PROP_TRANSLATE_X);
+        er_anim_value_bind(spin, pill, ER_PROP_ROTATE_Z);
+        er_anim_value_bind(fade, blink, ER_PROP_OPACITY);
+        er_anim_value_set(spin, rotate_z);
+        er_commit();
+    }
+
+    bool on = false;
+    for (int tx = 140; tx >= 0; tx -= 20)
+    {
+        on = !on;
+        if (animated)
+            er_anim_value_set(fade, on ? 0.5f : 1.0f);
+        else
+        {
+            kp.background_color = on ? 0xFFE0E040U : C_TOP;
+            er_node_set_props(blink, &kp);
+        }
+        er_commit();
+
+        if (animated)
+            er_anim_value_set(slide, (float)tx);
+        else
+        {
+            pp.transform_translate_x = (float)tx;
+            er_node_set_props(pill, &pp);
+        }
+        er_commit();
+    }
+
+    memcpy(reference, s_fb, sizeof(reference));
+    memset(s_fb, 0, sizeof(s_fb));
+    full_frame();
+    return memcmp(reference, s_fb, sizeof(reference)) == 0;
+}
+
+/*
+ * A translated node under an opaque cover must record where its pixels are (issue #312). A clipping container
+ * leaves its children's transforms out of subtree_prunable, so the cull can bury a translated child of one;
+ * render_tree walks it occluded and must still apply the translate offset, or it records its untranslated box
+ * and the next move erases that box instead of the pixels it painted, leaving a trail.
+ */
+static int check_translated_node_under_cover_leaves_no_trail(void)
+{
+    if (!slide_under_cover_matches_full_repaint(0.0f, false))
+        return fail("a translated node walked under an opaque cover left a trail when it next moved");
+    return EXIT_SUCCESS;
+}
+
+#if ERUI_TRANSFORMS_FULL
+/*
+ * The same slide with the pill rotated (issue #369). An occluded walk skips the capture, so it cannot record the
+ * transformed footprint the node's pixels occupy, and a record at the raw box would leave the rotated corners on
+ * screen after the next move. The cull must not bury the clipping bar at all while it holds such a node, even
+ * though the bar's subtree_prunable leaves the clipped child's transform out.
+ *
+ * Run twice: with the rotation set as a prop, and with it arriving on the native driver after the last layout
+ * pass, where nothing but the animation itself can tell the cached flag that the bar now holds one.
+ */
+static int check_rotated_node_in_clipper_not_buried(void)
+{
+    if (!slide_under_cover_matches_full_repaint(30.0f, false))
+        return fail("a rotated node inside a clipping container left a trail after being buried by an opaque cover");
+    if (!slide_under_cover_matches_full_repaint(30.0f, true))
+        return fail("a node rotated by an animation inside a clipping container left a trail after being buried");
+    return EXIT_SUCCESS;
+}
+
+/*
+ * A commit whose only change lands off-screen paints nothing, but still walks the tree, marked occluded, to retire
+ * the changed node's flags. The dirty chain reaches the root, so every node on that walk refreshes its paint
+ * record. A rotated node the walk does not capture must still record the transformed footprint its pixels
+ * occupy, or its next move erases the raw box instead and leaves the rotated corners on screen.
+ *
+ * Two nodes whose real paint falls back to the raw box ride along, so the walk has to predict the capture's
+ * admission rather than assume it: a rotated child of the rotated node (a capture is already running) and a
+ * rotated strip too wide for the transform source. A wrong guess for the strip over-erases rather than
+ * trails, so it is caught by the reported dirty rect instead: a record the damage pre-pass does not predict
+ * re-damages on every commit.
+ *
+ * @param[in] three_d  Tilt the three nodes with rotateX/rotateY and perspective instead of rotating them in
+ *                     the plane, so the walk takes the homography path instead of the affine one.
+ *
+ * @return NULL when every check holds, otherwise what failed.
+ */
+static const char* offscreen_change_keeps_transformed_footprint(bool three_d)
+{
+    static uint32_t reference[SCREEN * SCREEN];
+    er_reset();
+
+    ERNode* root = er_node_create(ER_NODE_VIEW);
+    ERProps rp = box(0, 0, SCREEN, SCREEN, C_ROOT);
+    rp.position = ER_POS_RELATIVE;
+    er_node_set_props(root, &rp);
+
+    ERNode* spun = er_node_create(ER_NODE_VIEW);
+    ERProps sp = box(40, 40, 60, 30, C_DEEP);
+    er_node_set_props(spun, &sp);
+
+    ERNode* nested = er_node_create(ER_NODE_VIEW);
+    ERProps np = box(10, 5, 20, 10, C_INNER);
+    er_node_set_props(nested, &np);
+    er_tree_append_child(spun, nested);
+
+    ERNode* wide = er_node_create(ER_NODE_VIEW);
+    ERProps wp = box(-30, 150, ERUI_XFORM_W + 10, 12, C_COVER);
+    er_node_set_props(wide, &wp);
+
+#if ERUI_3D_TRANSFORMS
+    if (three_d)
+    {
+        sp.transform_rotate_y = 50.0f;
+        sp.transform_perspective = 150.0f;
+        np.transform_rotate_x = 40.0f;
+        np.transform_perspective = 100.0f;
+        wp.transform_rotate_x = 30.0f;
+        wp.transform_perspective = 200.0f;
+    }
+    else
+#endif
+    {
+        (void)three_d;
+        sp.transform_rotate_z = 30.0f;
+        np.transform_rotate_z = 20.0f;
+        wp.transform_rotate_z = 3.0f;
+    }
+    er_node_set_props(spun, &sp);
+    er_node_set_props(nested, &np);
+    er_node_set_props(wide, &wp);
+
+    /* Entirely left of the screen: its damage clamps to nothing. */
+    ERNode* offscreen = er_node_create(ER_NODE_VIEW);
+    ERProps op = box(-100, 0, 20, 20, C_TOP);
+    er_node_set_props(offscreen, &op);
+
+    ERNode* marker = er_node_create(ER_NODE_VIEW);
+    ERProps mp = box(180, 180, 10, 10, C_TOP);
+    er_node_set_props(marker, &mp);
+
+    er_tree_append_child(root, spun);
+    er_tree_append_child(root, wide);
+    er_tree_append_child(root, offscreen);
+    er_tree_append_child(root, marker);
+    er_tree_set_root(root);
+
+    full_frame();
+
+    op.background_color = 0xFF123456U;
+    er_node_set_props(offscreen, &op);
+    er_commit();
+
+    /* Each record must also be the one the damage pre-pass predicts, or the node reads as moved on every
+     * commit from here on. Nothing repaints a clean node, so the pixels stay right and the check below
+     * would pass; what leaks is the reported dirty rect. Recolour a marker far from every transformed
+     * node: the report must be the marker alone. */
+    mp.background_color = 0xFF00AAFFU;
+    er_node_set_props(marker, &mp);
+    er_commit();
+    ERRect after;
+    if (!er_get_dirty_rect(&after))
+        return "recolouring the marker reported no damage";
+    if (after.x < 160 || after.y < 160)
+        return "after an off-screen-only commit, a transformed node re-damaged a footprint it did not paint";
+
+    /* That commit painted, so every record is a real one again. Go back off-screen, then move. */
+    op.background_color = C_TOP;
+    er_node_set_props(offscreen, &op);
+    er_commit();
+
+    /* Far enough that the new footprint cannot cover what the old one left: the erase of the old record
+     * alone decides whether the corners survive. */
+    sp.transform_translate_x = 100.0f;
+    sp.transform_translate_y = 90.0f;
+    er_node_set_props(spun, &sp);
+    wp.transform_translate_y = -20.0f;
+    er_node_set_props(wide, &wp);
+    er_commit();
+
+    memcpy(reference, s_fb, sizeof(reference));
+    memset(s_fb, 0, sizeof(s_fb));
+    full_frame();
+    if (memcmp(reference, s_fb, sizeof(reference)) != 0)
+        return "a transformed node left a trail after a commit whose only change was off-screen";
+    return NULL;
+}
+
+static int check_rotated_node_keeps_footprint_across_offscreen_change(void)
+{
+    const char* err = offscreen_change_keeps_transformed_footprint(false);
+    return err ? fail(err) : EXIT_SUCCESS;
+}
+
+#if ERUI_3D_TRANSFORMS
+/* The same with perspective tilts: the homography path predicts admission and records the projected AABB. */
+static int check_3d_node_keeps_footprint_across_offscreen_change(void)
+{
+    const char* err = offscreen_change_keeps_transformed_footprint(true);
+    return err ? fail(err) : EXIT_SUCCESS;
+}
+#endif
+#endif
+
 /*
  * The catch-all. Drive an incremental, damage-clipped sequence over a scene whose occluder is only
  * SOMETIMES a valid one, then compare against the same scene rendered with a forced full repaint.
@@ -493,6 +771,14 @@ int main(void)
         check_buried_change_retires,
 #if ERUI_TRANSFORMS_FULL
         check_transformed_sibling_not_buried,
+#endif
+        check_translated_node_under_cover_leaves_no_trail,
+#if ERUI_TRANSFORMS_FULL
+        check_rotated_node_in_clipper_not_buried,
+        check_rotated_node_keeps_footprint_across_offscreen_change,
+#if ERUI_3D_TRANSFORMS
+        check_3d_node_keeps_footprint_across_offscreen_change,
+#endif
 #endif
         check_pixel_equivalence,
     };
