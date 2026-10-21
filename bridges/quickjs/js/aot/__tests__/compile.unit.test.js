@@ -3542,6 +3542,33 @@ import {View, Text} from 'embedded-react';
     expect(texts(c)).toContain('i=module');
   });
 
+  it('a prop default folds with module consts, not the caller\'s', () => {
+    const c = gen(`${D}const SIZE = 30;
+      function Box({ size = SIZE }) { return (<View style={{width: size}} />); }
+      export function App() { const SIZE = 7; return (<View><Box /></View>); }`);
+    expect(c).toContain('p.width = 30;');
+    expect(c).not.toContain('p.width = 7;');
+  });
+
+  it("a prop default sees the pattern's own names, not same-named module consts", () => {
+    const c = gen(`${D}const SIZE = 30;
+      function Box({ SIZE = 5, size = SIZE }) { return (<View style={{width: size}} />); }
+      export function App() { return (<View><Box /><Box SIZE={9} /></View>); }`);
+    expect(c).toContain('p.width = 5;');
+    expect(c).toContain('p.width = 9;');
+    expect(c).not.toContain('p.width = 30;');
+  });
+
+  it('a prop default cannot read its own or a later binding', () => {
+    for (const params of ['{ size = size }', '{ size = SIZE, SIZE = 5 }']) {
+      expect(() =>
+        gen(`${D}const size = 30; const SIZE = 30;
+          function Box(${params}) { return (<View style={{width: size}} />); }
+          export function App() { return (<View><Box /></View>); }`),
+      ).toThrow(/cannot statically resolve identifier/);
+    }
+  });
+
   // Styles fold constants through the same scope as text, so a runtime binding has to beat a same-named
   // module const there too — otherwise the fold silently emits the module value where the prop or row
   // item was meant. `width` is a supported dynamic style, so a correct lowering is observable.
