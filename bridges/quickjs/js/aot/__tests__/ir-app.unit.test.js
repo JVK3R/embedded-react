@@ -343,10 +343,10 @@ describe('app_update() sets again only what a state change affects', () => {
       '    const ErAppChanged changed = s_changed;\n    memset(&s_changed, 0, sizeof(s_changed));',
     );
     expect(update).toMatch(
-      /    if \(changed\.a\)\n    \{\n[^}]*"%d", s_state\.a\);\n        er_node_set_props\(s_n2, &p\);\n    \}/,
+      /    if \(changed\.a\)\n    \{\n        er_props_default\(&p\);\n        if \(snprintf\(p\.text, sizeof\(p\.text\), "%d", s_state\.a\) >= \(int\)sizeof\(p\.text\)\)\n        \{\n            APP_LIMIT\("text cut short at ER_TEXT_MAX"\);\n        \}\n        er_node_set_props\(s_n2, &p\);\n    \}/,
     );
     expect(update).toMatch(
-      /    if \(changed\.b\)\n    \{\n[^}]*"%d", s_state\.b\);\n        er_node_set_props\(s_n3, &p\);\n    \}/,
+      /    if \(changed\.b\)\n    \{\n        er_props_default\(&p\);\n        if \(snprintf\(p\.text, sizeof\(p\.text\), "%d", s_state\.b\) >= \(int\)sizeof\(p\.text\)\)\n        \{\n            APP_LIMIT\("text cut short at ER_TEXT_MAX"\);\n        \}\n        er_node_set_props\(s_n3, &p\);\n    \}/,
     );
 
     // The handler flags only the state it wrote.
@@ -399,7 +399,7 @@ describe('app_update() sets again only what a state change affects', () => {
     expect(update.match(/if \(changed\.items\)/g)).toHaveLength(1);
     expect(update.match(/er_node_set_props/g).length).toBeGreaterThan(1);
     expect(c).toMatch(
-      /        s_items_count\+\+;\n    \}\n    s_changed\.items = 1;\n    app_update\(\);/,
+      /        s_items_count\+\+;\n    \}\n    else\n    \{\n        APP_LIMIT\("list 'items' full, raise ER_AOT_LIST_CAP"\);\n    \}\n    s_changed\.items = 1;\n    app_update\(\);/,
     );
   });
 

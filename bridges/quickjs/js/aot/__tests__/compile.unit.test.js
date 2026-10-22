@@ -15,7 +15,9 @@
  */
 
 import {describe, it, expect, vi} from 'vitest';
+import {readFileSync} from 'node:fs';
 import {compileSource} from '../compile.mts';
+import {ENGINE_STRING_MAX} from '../compiler/diagnostics.mts';
 import {flattenSvg} from '../../src/embedded-react/svg-ops.js';
 
 // The Flow B AOT compiler turns an App.jsx source string into C. These tests assert on the generated C
@@ -33,8 +35,8 @@ describe('AOT baseline (regression)', () => {
       export function App() {
         return (<View><Text>Hello</Text></View>);
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_VIEW)');
-    expect(c).toContain('er_node_create(ER_NODE_TEXT)');
+    expect(c).toContain('app_node_create(ER_NODE_VIEW)');
+    expect(c).toContain('app_node_create(ER_NODE_TEXT)');
     expect(c).toContain('"Hello"');
     expect(c).toContain('bool er_app_build(int screen_w, int screen_h)');
   });
@@ -265,7 +267,7 @@ describe('AOT baseline (regression)', () => {
     );
     // the Text node renders the string with %s
     expect(c).toContain(
-      'snprintf(p.text, sizeof(p.text), "%s", s_state.label);',
+      'if (snprintf(p.text, sizeof(p.text), "%s", s_state.label) >= (int)sizeof(p.text))',
     );
   });
 
@@ -317,7 +319,7 @@ describe('AOT baseline (regression)', () => {
           </Svg>
         );
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_VECTOR)');
+    expect(c).toContain('app_node_create(ER_NODE_VECTOR)');
     expect(c).toContain('static const float s_svg0_ops[]');
     expect(c).toContain('static const ERVectorPaint s_svg0_paints[]');
     expect(c).toMatch(
@@ -625,7 +627,7 @@ describe('AOT baseline (regression)', () => {
       'test',
       {svgArtifacts: {badge: artifact}},
     );
-    expect(res.c).toContain('er_node_create(ER_NODE_IMAGE)'); // raster → image node
+    expect(res.c).toContain('app_node_create(ER_NODE_IMAGE)'); // raster → image node
     expect(res.c).toContain(
       'snprintf(p.image_name, sizeof(p.image_name), "%s", "badge")',
     );
@@ -729,7 +731,7 @@ describe('AOT baseline (regression)', () => {
       const Badge = memo(function Badge({ label }) { return (<Text>{label}</Text>); });
       export function App() { return (<View><Badge label="hi" /></View>); }`);
     expect(c).toContain('"hi"'); // inlined, prop substituted
-    expect(c).toContain('er_node_create(ER_NODE_TEXT)');
+    expect(c).toContain('app_node_create(ER_NODE_TEXT)');
   });
 
   it('emits props.children (destructured) passed to a component', () => {
@@ -737,7 +739,7 @@ describe('AOT baseline (regression)', () => {
       function Card({ children }) { return (<View style={{ padding: 8 }}>{children}</View>); }
       export function App() { return (<Card><Text>inside</Text></Card>); }`);
     expect(c).toContain('"inside"'); // the child Text is emitted
-    expect(c).toContain('er_node_create(ER_NODE_VIEW)');
+    expect(c).toContain('app_node_create(ER_NODE_VIEW)');
   });
 
   it('emits props.children via the whole-props parameter', () => {
@@ -2419,7 +2421,7 @@ describe('AOT Switch', () => {
         const [on, setOn] = useState(false);
         return (<Switch value={on} onValueChange={(v) => setOn(v)} />);
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_SWITCH)');
+    expect(c).toContain('app_node_create(ER_NODE_SWITCH)');
     expect(c).toContain('p.switch_value = (uint8_t)((s_state.on) ? 1 : 0);'); // state-driven value
     expect(c).toMatch(/er_event_set\(n\d+, ER_EVENT_PRESS,/); // engine toggles + fires PRESS
     expect(c).toContain('s_state.on = (!(s_state.on));'); // onValueChange's v param = the toggled value
@@ -2459,7 +2461,7 @@ describe('AOT Dial', () => {
                       knob="circle" adjustable trackColor="#30343a" indicatorColor="#ff8800"
                       onChange={(v) => setTemp(v)} style={{ width: 200, height: 200 }} />);
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_ARC)');
+    expect(c).toContain('app_node_create(ER_NODE_ARC)');
     expect(c).toContain('p.arc_value = (float)(s_state.temp);'); // state-driven value (app_update)
     expect(c).toContain('p.arc_min = 10.0f;');
     expect(c).toContain('p.arc_max = 30.0f;');
@@ -2570,7 +2572,7 @@ describe('AOT ActivityIndicator', () => {
     const c = gen(`${PRE}
       import { ActivityIndicator } from 'embedded-react';
       export function App() { return (<ActivityIndicator size="large" color="#2a9d8f" />); }`);
-    expect(c).toContain('er_node_create(ER_NODE_ACTIVITY_INDICATOR)');
+    expect(c).toContain('app_node_create(ER_NODE_ACTIVITY_INDICATOR)');
     expect(c).toContain('p.indicator_color = 0xFF2A9D8Fu;');
     expect(c).toContain('p.width = 36;'); // large
     expect(c).toContain('p.height = 36;');
@@ -2603,7 +2605,7 @@ describe('AOT Modal', () => {
         const [show, setShow] = useState(false);
         return (<Modal visible={show} backdropColor="#000000cc"><Text>Hi</Text></Modal>);
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_MODAL)');
+    expect(c).toContain('app_node_create(ER_NODE_MODAL)');
     expect(c).toContain('p.modal_visible = (uint8_t)((s_state.show) ? 1 : 0);');
     // <Modal>'s `visible` is its OWN show/hide prop — the engine derives layout.display from
     // modal_visible itself. The generic visible->display alias must not also fire here, or the node
@@ -2712,7 +2714,7 @@ describe('AOT nested Text spans', () => {
         );
       }`);
     expect(c).toContain(
-      'snprintf(p.text, sizeof(p.text), "%d items of   %d", s_state.count, s_state.count);',
+      'if (snprintf(p.text, sizeof(p.text), "%d items of   %d", s_state.count, s_state.count) >= (int)sizeof(p.text))',
     );
   });
 });
@@ -2725,7 +2727,7 @@ describe('AOT FlatList (thin rewrite → ScrollView + .map)', () => {
       export function App() {
         return (<FlatList style={{ flex: 1 }} data={ITEMS} keyExtractor={(it) => it.id} renderItem={({ item }) => (<View style={{ padding: 8 }}><Text>{item.name}</Text></View>)} />);
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_SCROLL_VIEW)'); // FlatList IS a ScrollView in the engine
+    expect(c).toContain('app_node_create(ER_NODE_SCROLL_VIEW)'); // FlatList IS a ScrollView in the engine
     expect(c).toContain('"A"');
     expect(c).toContain('"B"');
     expect(c).toContain('p.padding = 8;'); // renderItem's per-row style
@@ -2738,7 +2740,7 @@ describe('AOT FlatList (thin rewrite → ScrollView + .map)', () => {
         const [items, setItems] = useState([{ id: 1, label: 'Row' }]);
         return (<FlatList data={items} renderItem={({ item, index }) => (<View><Text>{item.label}</Text></View>)} />);
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_SCROLL_VIEW)');
+    expect(c).toContain('app_node_create(ER_NODE_SCROLL_VIEW)');
     expect(c).toContain('s_items'); // the list-state pool array
   });
 
@@ -2807,7 +2809,7 @@ import { View, Text, Pressable, TouchableOpacity, useAnimatedValue } from 'embed
       export function App() {
         return (<TouchableOpacity><Text>tap</Text></TouchableOpacity>);
       }`);
-    expect(c.match(/er_node_create\(ER_NODE_PRESSABLE\)/g)).toHaveLength(1);
+    expect(c.match(/app_node_create\(ER_NODE_PRESSABLE\)/g)).toHaveLength(1);
     expect(c).toContain('er_anim_value_create(1.0f)');
     expect(c).toMatch(
       /er_anim_value_bind\(s_av_press_\w+, \w+, ER_PROP_OPACITY\)/,
@@ -2866,7 +2868,7 @@ import { View, Text, Pressable, TouchableOpacity, useAnimatedValue } from 'embed
       export function App() {
         return (<TouchableOpacity disabled onPress={() => {}}><Text>x</Text></TouchableOpacity>);
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_PRESSABLE)');
+    expect(c).toContain('app_node_create(ER_NODE_PRESSABLE)');
     expect(c).not.toContain('er_event_set(');
     expect(c).not.toContain('er_anim_value_bind(');
   });
@@ -2981,7 +2983,7 @@ import { View, Text, Pressable, TouchableOpacity, useAnimatedValue } from 'embed
       export function App() {
         return (<TouchableOpacity disabled style={{padding: 8, opacity: 0.8}}><Text>label</Text></TouchableOpacity>);
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_TEXT)'); // children still mount
+    expect(c).toContain('app_node_create(ER_NODE_TEXT)'); // children still mount
     expect(c).toContain('"label"');
     expect(c).toContain('p.padding = 8;'); // …and still lay out
     expect(c).toContain('p.opacity = 204;'); // …at the opacity the style asked for
@@ -3000,7 +3002,7 @@ import { View, Text, Pressable } from 'embedded-react';
       export function App() {
         return (<Pressable disabled onPress={() => {}} onLongPress={() => {}}><Text>x</Text></Pressable>);
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_PRESSABLE)');
+    expect(c).toContain('app_node_create(ER_NODE_PRESSABLE)');
     expect(c).not.toContain('er_event_set(');
   });
 
@@ -3019,7 +3021,7 @@ import { View, Text, Pressable } from 'embedded-react';
       export function App() {
         return (<Pressable disabled style={{padding: 8, opacity: 0.8}}><Text>label</Text></Pressable>);
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_TEXT)');
+    expect(c).toContain('app_node_create(ER_NODE_TEXT)');
     expect(c).toContain('"label"');
     expect(c).toContain('p.padding = 8;');
     expect(c).toContain('p.opacity = 204;');
@@ -3090,15 +3092,18 @@ import { View, Text, TextInput } from 'embedded-react';
         const [name, setName] = useState('');
         return (<TextInput value={name} onChangeText={(t) => setName(t)} placeholder="Name" placeholderTextColor="#888" />);
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_TEXT_INPUT)');
+    expect(c).toContain('app_node_create(ER_NODE_TEXT_INPUT)');
     expect(c).toContain('ER_EVENT_CHANGE_TEXT');
     // onChangeText param binds to the new text; setName(t) → snprintf from data->changed_text
     expect(c).toContain(
-      'snprintf(s_state.name, sizeof(s_state.name), "%s", data->changed_text);',
+      'if (snprintf(s_state.name, sizeof(s_state.name), "%s", data->changed_text) >= (int)sizeof(s_state.name))',
+    );
+    expect(c).toContain(
+      'APP_LIMIT("state \'name\' cut short, raise ER_AOT_LIST_STR_CAP");',
     );
     // value drives the buffer (synced in app_update), placeholder + color applied
     expect(c).toContain(
-      'snprintf(p.text, sizeof(p.text), "%s", s_state.name);',
+      'if (snprintf(p.text, sizeof(p.text), "%s", s_state.name) >= (int)sizeof(p.text))',
     );
     expect(c).toContain(
       'snprintf(p.placeholder, sizeof(p.placeholder), "%s", "Name");',
@@ -3111,7 +3116,7 @@ import { View, Text, TextInput } from 'embedded-react';
       export function App() {
         return (<TextInput value="hi" placeholder="type" editable={false} />);
       }`);
-    expect(c).toContain('er_node_create(ER_NODE_TEXT_INPUT)');
+    expect(c).toContain('app_node_create(ER_NODE_TEXT_INPUT)');
     expect(c).toContain('snprintf(p.text, sizeof(p.text), "%s", "hi");');
     expect(c).toContain('p.editable = 0;');
   });
@@ -3231,7 +3236,7 @@ import logo from './assets/logo.png';
       'demo',
     ).c;
     expect(c).toContain(
-      'snprintf(p.image_name, sizeof(p.image_name), "%s", s_items[0].icon);',
+      'if (snprintf(p.image_name, sizeof(p.image_name), "%s", s_items[0].icon) >= (int)sizeof(p.image_name))',
     );
   });
 
@@ -3241,7 +3246,7 @@ import logo from './assets/logo.png';
       'demo',
     );
     expect(r.c).toContain(
-      'snprintf(p.image_name, sizeof(p.image_name), "%s", (s_state.day ? "sun" : "moon"));',
+      'if (snprintf(p.image_name, sizeof(p.image_name), "%s", (s_state.day ? "sun" : "moon")) >= (int)sizeof(p.image_name))',
     );
     expect(r.images.map(i => i.name).sort()).toEqual(['moon', 'sun']);
   });
@@ -3461,7 +3466,7 @@ describe('AOT useHostValue (host-fed input)', () => {
     expect(c).toContain('int steps;'); // field in ErAppState
     expect(c).toContain('.steps = 0'); // initializer
     expect(c).toContain(
-      'snprintf(p.text, sizeof(p.text), "%d", s_state.steps);',
+      'if (snprintf(p.text, sizeof(p.text), "%d", s_state.steps) >= (int)sizeof(p.text))',
     ); // read into Text
     expect(c).toContain('void er_app_set_steps(int v)'); // generated public setter
     expect(c).toContain('s_state.steps = v;');
@@ -3573,7 +3578,7 @@ import {View, Text} from 'embedded-react';
     expect(texts(c)).toContain('i=module');
   });
 
-  it('a prop default folds with module consts, not the caller\'s', () => {
+  it("a prop default folds with module consts, not the caller's", () => {
     const c = gen(`${D}const SIZE = 30;
       function Box({ size = SIZE }) { return (<View style={{width: size}} />); }
       export function App() { const SIZE = 7; return (<View><Box /></View>); }`);
@@ -3749,9 +3754,11 @@ import {View, Text, Pressable, Switch} from 'embedded-react';
       return (<Pressable onPress={() => { const t = label; setLabel(t + '!'); }}><Text>{label}</Text></Pressable>);
     }`);
     expect(c).toContain('char l_t[48];');
-    expect(c).toContain('snprintf(l_t, sizeof(l_t), "%s", s_state.label);');
     expect(c).toContain(
-      'snprintf(s_state.label, sizeof(s_state.label), "%s!", l_t);',
+      'if (snprintf(l_t, sizeof(l_t), "%s", s_state.label) >= (int)sizeof(l_t))',
+    );
+    expect(c).toContain(
+      'if (snprintf(s_state.label, sizeof(s_state.label), "%s!", l_t) >= (int)sizeof(s_state.label))',
     );
     expect(c).not.toContain('int l_t');
   });
@@ -4257,7 +4264,7 @@ import { View, Text, TextInput } from 'embedded-react';
         return (<Text>{'render-check ' + (page + 1) + '/' + PAGES}</Text>);
       }`);
     expect(c).toContain(
-      'snprintf(p.text, sizeof(p.text), "render-check %d/4", app_add(s_state.page, 1));',
+      'if (snprintf(p.text, sizeof(p.text), "render-check %d/4", app_add(s_state.page, 1)) >= (int)sizeof(p.text))',
     );
   });
 
@@ -4505,7 +4512,9 @@ import { View, Text, TextInput } from 'embedded-react';
         return (<Pressable onPress={() => setLabel(label + '!')}><Text>{label}</Text></Pressable>);
       }`);
     expect(c).toContain('char next[sizeof(s_state.label)];');
-    expect(c).toContain('snprintf(next, sizeof(next), "%s!", s_state.label);');
+    expect(c).toContain(
+      'if (snprintf(next, sizeof(next), "%s!", s_state.label) >= (int)sizeof(next))',
+    );
     expect(c).toContain('memcpy(s_state.label, next, strlen(next) + 1);');
     expect(c).not.toContain(
       'snprintf(s_state.label, sizeof(s_state.label), "%s!"',
@@ -4520,7 +4529,7 @@ import { View, Text, TextInput } from 'embedded-react';
         return (<Pressable onPress={() => setLabel('x' + n)}><Text>{label}</Text></Pressable>);
       }`);
     expect(c).toContain(
-      'snprintf(s_state.label, sizeof(s_state.label), "x%d", s_state.n);',
+      'if (snprintf(s_state.label, sizeof(s_state.label), "x%d", s_state.n) >= (int)sizeof(s_state.label))',
     );
     expect(c).not.toContain('char next[');
   });
@@ -4563,7 +4572,7 @@ import { View, Text, TextInput } from 'embedded-react';
         return (<Text onPress={() => setLabel('hit ' + n)}>x</Text>);
       }`);
     expect(c).toContain(
-      'snprintf(s_state.label, sizeof(s_state.label), "hit %d", s_state.n);',
+      'if (snprintf(s_state.label, sizeof(s_state.label), "hit %d", s_state.n) >= (int)sizeof(s_state.label))',
     );
   });
 
@@ -4847,6 +4856,161 @@ describe('AOT list setters', () => {
     );
     expect(() => app('setItems(items.slice(k));')).toThrow(
       /only items\.slice\(0, end\) is supported/,
+    );
+  });
+});
+
+describe('AOT fixed limits', () => {
+  const T = `import {useState} from 'react';\nimport {Text, Pressable} from 'embedded-react';\n`;
+  const small = src =>
+    compileSource(T + src, 'test', {listCap: 2, listStrCap: 8}).c;
+
+  it('refuses an initial list with more rows than a list holds', () => {
+    expect(() =>
+      small(`export function App() {
+        const [items] = useState([{v: 1}, {v: 2}, {v: 3}]);
+        return (<Text>{items.length}</Text>);
+      }`),
+    ).toThrow(/list state "items" starts with 3 rows, but a list holds 2/);
+  });
+
+  it('refuses an initial string longer than its buffer', () => {
+    expect(() =>
+      small(`export function App() {
+        const [label] = useState('12345678');
+        return (<Text>{label}</Text>);
+      }`),
+    ).toThrow(/state "label" starts 8 bytes long, but a string holds 7 bytes/);
+    expect(() =>
+      small(`export function App() {
+        const [items] = useState([{t: 'ok'}, {t: 'much too long'}]);
+        return (<Text>{items.length}</Text>);
+      }`),
+    ).toThrow(/field "t" of list state "items" starts 13 bytes long/);
+  });
+
+  it('refuses a constant string write longer than its buffer', () => {
+    expect(() =>
+      small(`export function App() {
+        const [label, setLabel] = useState('');
+        return (<Pressable onPress={() => setLabel('much too long')}><Text>{label}</Text></Pressable>);
+      }`),
+    ).toThrow(
+      /state "label" is set to a 13-byte string, but a string holds 7 bytes/,
+    );
+    expect(() =>
+      small(`export function App() {
+        const [items, setItems] = useState([{t: ''}]);
+        return (<Pressable onPress={() => setItems([...items, {t: 'much too long'}])}><Text>x</Text></Pressable>);
+      }`),
+    ).toThrow(/field "t" of list state "items" is set to a 13-byte string/);
+    expect(() =>
+      small(`export function App() {
+        const [label, setLabel] = useState('');
+        return (<Pressable onPress={() => { const t = 'much too long'; setLabel(t); }}><Text>{label}</Text></Pressable>);
+      }`),
+    ).toThrow(/local "t" is set to a 13-byte string/);
+  });
+
+  it('writes a constant that fits with no run-time check', () => {
+    const c = small(`export function App() {
+      const [label, setLabel] = useState('');
+      return (<Pressable onPress={() => setLabel('1234567')}><Text>{label}</Text></Pressable>);
+    }`);
+    expect(c).toContain(
+      '    snprintf(s_state.label, sizeof(s_state.label), "%s", "1234567");',
+    );
+    expect(c).not.toContain("APP_LIMIT(\"state 'label'");
+  });
+
+  it('reports a full list and a string cut short at run time', () => {
+    const c = small(`export function App() {
+      const [n, setN] = useState(0);
+      const [label, setLabel] = useState('');
+      const [items, setItems] = useState([{t: ''}]);
+      return (<Pressable onPress={() => { setLabel('n=' + n); setItems([...items, {t: 'n=' + n}]); }}><Text>{label}</Text></Pressable>);
+    }`);
+    expect(c).toContain(
+      'APP_LIMIT("state \'label\' cut short, raise ER_AOT_LIST_STR_CAP");',
+    );
+    expect(c).toContain(
+      "APP_LIMIT(\"field 't' of list 'items' cut short, raise ER_AOT_LIST_STR_CAP\");",
+    );
+    expect(c).toContain(
+      'APP_LIMIT("list \'items\' full, raise ER_AOT_LIST_CAP");',
+    );
+  });
+
+  it('checks the node pool against the tree at C compile time', () => {
+    const c = gen(`${T}export function App() {
+      return (<Pressable><Text>a</Text><Text>b</Text></Pressable>);
+    }`);
+    // The root and three nodes.
+    expect(c).toContain(
+      '_Static_assert(ERUI_MAX_NODES >= 4, "this app builds 4 nodes: raise ERUI_MAX_NODES to at least 4");',
+    );
+    expect(c).toContain('APP_LIMIT("node pool full, raise ERUI_MAX_NODES");');
+  });
+
+  it('keeps its copy of the engine string limits in step with er_scene.h', () => {
+    const header = readFileSync(
+      new URL('../../../../../engine/include/er_scene.h', import.meta.url),
+      'utf8',
+    );
+    for (const [name, max] of Object.entries(ENGINE_STRING_MAX)) {
+      expect(header).toMatch(new RegExp(`#define ${name} ${max}\\b`));
+    }
+  });
+
+  it('refuses constant node text too long for the engine', () => {
+    const long = 'x'.repeat(256);
+    expect(() =>
+      gen(`${T}export function App() { return (<Text>${long}</Text>); }`),
+    ).toThrow(
+      /a <Text> is 256 bytes, but the engine holds 255 \(ER_TEXT_MAX\)/,
+    );
+    expect(() =>
+      gen(
+        `${T}export function App() { return (<Text>a<Text>${'x'.repeat(64)}</Text></Text>); }`,
+      ),
+    ).toThrow(/a <Text> span is 64 bytes, but the engine holds 63/);
+    expect(() =>
+      gen(
+        `import {TextInput} from 'embedded-react';
+         export function App() { return (<TextInput placeholder="${'x'.repeat(64)}" />); }`,
+      ),
+    ).toThrow(/a <TextInput> placeholder is 64 bytes/);
+    expect(() =>
+      gen(
+        `import {TextInput} from 'embedded-react';
+         export function App() { return (<TextInput value="${long}" />); }`,
+      ),
+    ).toThrow(/a <TextInput> value is 256 bytes/);
+    expect(
+      gen(
+        `${T}export function App() { return (<Text>${'x'.repeat(255)}</Text>); }`,
+      ),
+    ).not.toContain('ER_TEXT_MAX');
+  });
+
+  it('reports node text cut short at run time', () => {
+    const c = gen(`${T}export function App() {
+      const [n, setN] = useState(0);
+      return (<Pressable onPress={() => setN(n + 1)}><Text>{n}</Text></Pressable>);
+    }`);
+    expect(c).toContain(
+      'if (snprintf(p.text, sizeof(p.text), "%d", s_state.n) >= (int)sizeof(p.text))',
+    );
+    expect(c).toContain('APP_LIMIT("text cut short at ER_TEXT_MAX");');
+  });
+
+  it('reports a full timer table', () => {
+    const c = gen(`${T}export function App() {
+      const [n, setN] = useState(0);
+      return (<Pressable onPress={() => setTimeout(() => setN(1), 10)}><Text>{n}</Text></Pressable>);
+    }`);
+    expect(c).toContain(
+      'APP_LIMIT("timer table full, raise ER_AOT_MAX_TIMERS");',
     );
   });
 });
