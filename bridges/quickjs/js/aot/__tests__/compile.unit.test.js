@@ -4702,6 +4702,62 @@ import { View, StyleSheet } from 'embedded-react';
     ).toThrow(/style "valueOf" is not supported/);
   });
 
+  it('rejects an Object.prototype name as an enum value', () => {
+    const e = err(`${D}
+      export function App() {
+        return (<View style={{alignItems: 'toString'}} />);
+      }`);
+    expect(e.message).toMatch(/unsupported value for style "alignItems"/);
+  });
+
+  it('rejects an Object.prototype name as a color', () => {
+    const e = err(`${D}
+      export function App() {
+        return (<View style={{backgroundColor: 'constructor'}} />);
+      }`);
+    expect(e.message).toMatch(/unsupported color "constructor"/);
+  });
+
+  it('does not resolve an undeclared Object.prototype name as a constant', () => {
+    expect(() =>
+      gen(`${D}
+      export function App() {
+        return (<View style={{width: toString ? 10 : 20}} />);
+      }`),
+    ).toThrow(/resolve identifier "toString"/);
+  });
+
+  it('still resolves a declared const named like an Object.prototype method', () => {
+    const c = gen(`${D}const toString = 12;
+      export function App() {
+        return (<View style={{width: toString}} />);
+      }`);
+    expect(c).toContain('p.width = 12;');
+  });
+
+  it('binds a const named __proto__ as a name, not the scope prototype', () => {
+    const c = gen(`${D}const __proto__ = 12;
+      export function App() {
+        return (<View style={{width: __proto__}} />);
+      }`);
+    expect(c).toContain('p.width = 12;');
+    expect(() =>
+      gen(`${D}const __proto__ = {SIZE: 5};
+      export function App() {
+        return (<View style={{width: SIZE}} />);
+      }`),
+    ).toThrow(/resolve identifier "SIZE"/);
+  });
+
+  it('rejects an Object.prototype name in a state-driven enum style', () => {
+    const e = err(`${D}
+      export function App() {
+        const [on, setOn] = useState(false);
+        return (<View style={{alignItems: on ? 'toString' : 'center'}} />);
+      }`);
+    expect(e.message).toMatch(/unsupported enum value "toString"/);
+  });
+
   it('locates an unknown key that arrived through a StyleSheet', () => {
     const e = err(`${D}
       const styles = StyleSheet.create({ card: { shadowOpacity: 0.5 } });

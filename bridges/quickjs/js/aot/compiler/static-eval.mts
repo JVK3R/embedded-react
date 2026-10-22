@@ -139,7 +139,7 @@ function snapshotOf(fold: Fold): Scope {
   if (!fold.snapshot) {
     const copy: Scope = {};
     for (const name in fold.scope) {
-      copy[name] = fold.scope[name];
+      setBinding(copy, name, fold.scope[name]);
     }
     fold.snapshot = copy;
   }
@@ -365,7 +365,7 @@ function evaluate(node: t.Node, scope: Scope, fold: Fold): unknown {
         : evaluate(node.alternate, scope, fold);
     }
     case 'Identifier':
-      if (node.name in scope) return scope[node.name];
+      if (hasBinding(scope, node.name)) return scope[node.name];
       throw new Error(
         `AOT: cannot statically resolve identifier "${node.name}"`,
       );
@@ -435,7 +435,7 @@ function evaluate(node: t.Node, scope: Scope, fold: Fold): unknown {
         !callee.computed &&
         callee.object.type === 'Identifier' &&
         callee.object.name === 'Math' &&
-        !('Math' in scope)
+        !hasBinding(scope, 'Math')
           ? (callee.property as t.Identifier).name
           : null;
       if (mathFn && Object.hasOwn(STATIC_MATH, mathFn)) {
@@ -531,7 +531,7 @@ export function foldScope(env: Env, scope: Scope): Scope {
   // Copy the scope only when a runtime name actually shadows one of its constants.
   let hasShadowedName = false;
   for (const name of runtimeNames) {
-    if (name in scope) {
+    if (hasBinding(scope, name)) {
       hasShadowedName = true;
       break;
     }
@@ -541,6 +541,42 @@ export function foldScope(env: Env, scope: Scope): Scope {
   return Object.fromEntries(
     Object.entries(scope).filter(([name]) => !runtimeNames.has(name)),
   );
+}
+
+/**
+ * Whether `scope` binds `name`, through the scopes it reads through to but not Object.prototype.
+ *
+ * @param scope  Compile-time constants in reach.
+ * @param name  The identifier.
+ *
+ * @returns True when a scope in the chain has it as its own.
+ */
+export function hasBinding(scope: Scope, name: string): boolean {
+  for (
+    let layer: object | null = scope;
+    layer && layer !== Object.prototype;
+    layer = Object.getPrototypeOf(layer)
+  ) {
+    if (Object.hasOwn(layer, name)) return true;
+  }
+
+  return false;
+}
+
+/**
+ * Binds `name` in `scope` as its own property, so `__proto__` is a name rather than Object.prototype's setter.
+ *
+ * @param scope  The scope to bind in.
+ * @param name  The identifier.
+ * @param value  Its value.
+ */
+export function setBinding(scope: Scope, name: string, value: unknown): void {
+  Object.defineProperty(scope, name, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
 }
 
 /**
