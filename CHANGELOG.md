@@ -10,6 +10,11 @@ ESP-IDF Component Registry, PlatformIO) — a single version drives every artifa
 See [Releasing](https://embedded-react.dev/internals/releasing) for the release process.
 
 ## [Unreleased]
+### Changed
+
+- `onLayout` now reports `x`/`y` relative to the parent instead of the screen, in both flows, and the
+  rect is also at `e.nativeEvent.layout`, as in React Native.
+
 ### Fixed
 
 - Named colors now resolve the same in Flow A styles, SVG paint and Flow B: one shared list with CSS

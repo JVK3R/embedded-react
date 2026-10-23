@@ -1725,6 +1725,16 @@ describe('AOT touch drag', () => {
     ).toHaveLength(2);
   });
 
+  it('reads the onLayout rect from e.nativeEvent.layout as React Native does', () => {
+    const c = gen(`${PRE}
+      import { useRef } from 'react';
+      export function App() {
+        const top = useRef(0);
+        return <View onLayout={(e) => { top.current = e.nativeEvent.layout.y; }} />;
+      }`);
+    expect(c).toContain('s_ref_top = data->layout_rect.y;');
+  });
+
   it('treats useState(70.0) as a FLOAT slot (decimal literal forces float, value stays sub-integer)', () => {
     const c = gen(`${PRE}
       export function App() {
