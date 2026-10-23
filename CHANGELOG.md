@@ -13,7 +13,8 @@ See [Releasing](https://embedded-react.dev/internals/releasing) for the release 
 ### Changed
 
 - `onLayout` now reports `x`/`y` relative to the parent instead of the screen, in both flows, and the
-  rect is also at `e.nativeEvent.layout`, as in React Native.
+  rect is also at `e.nativeEvent.layout`, as in React Native. A hidden node reports an empty box at 0,0.
+- AOT: reading `e.layout` outside an `onLayout` handler is now a compile error.
 
 ### Fixed
 

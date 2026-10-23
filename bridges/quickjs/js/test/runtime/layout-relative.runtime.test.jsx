@@ -25,7 +25,7 @@ let inner = null;
 let sameObject = false;
 let innerFires = 0;
 
-function App({left}) {
+function App({left, padding = 5}) {
   return (
     <View
       style={{
@@ -34,7 +34,7 @@ function App({left}) {
         top: 30,
         width: 100,
         height: 80,
-        padding: 5,
+        padding,
       }}
       onLayout={e => (outer = e.nativeEvent.layout)}>
       <View
@@ -68,6 +68,16 @@ check(outer.x === 60, 'outer box moved to 60');
 check(
   innerFires === 1,
   `inner box did not fire when only its parent moved (fired ${innerFires})`,
+);
+
+root.render(<App left={60} padding={9} />);
+check(
+  innerFires === 2,
+  `inner box fired when the parent's padding moved it (fired ${innerFires})`,
+);
+check(
+  inner.x === 12 && inner.y === 9,
+  `inner box at its new place in the parent (got ${inner.x},${inner.y}, want 12,9)`,
 );
 
 report('layout-relative');

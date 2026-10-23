@@ -1654,6 +1654,12 @@ function sourceOf(node: t.Node, env: Env): IrSource {
         (object.property as t.Identifier).name === 'layout' &&
         isEventRoot(object.object, env.event)
       ) {
+        if (!env.layout) {
+          throw aotError(
+            'AOT: only an onLayout event carries a layout rect',
+            'read e.layout (or e.nativeEvent.layout) inside an onLayout handler.',
+          );
+        }
         if (!LAYOUT_FIELDS.has(prop as string)) {
           throw new Error(
             `AOT: unknown onLayout rect field "${prop}" (use x / y / width / height)`,

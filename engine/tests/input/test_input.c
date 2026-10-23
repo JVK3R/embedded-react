@@ -3550,6 +3550,39 @@ static int test_layout_event_parent_relative(void)
     if (child_rec.count != 2 || child_rec.rect.x != 12 || child_rec.rect.y != 9)
         return fail("layout event: child did not fire after moving inside its parent");
 
+    /* Hide the child: it reports an empty box at 0,0, and moving the parent leaves it quiet */
+    cp.display = ER_DISPLAY_NONE;
+    er_node_set_props(child, &cp);
+    er_commit();
+
+    if (child_rec.count != 3 || child_rec.rect.x != 0 || child_rec.rect.y != 0 || child_rec.rect.w != 0
+        || child_rec.rect.h != 0)
+        return fail("layout event: hidden child did not report an empty box at 0,0");
+
+    pp.left = 80;
+    er_node_set_props(parent, &pp);
+    er_commit();
+
+    if (child_rec.count != 3)
+        return fail("layout event: hidden child fired when its parent moved");
+
+    /* Show it again, then hide the parent: the parent reports empty and the child stays quiet */
+    cp.display = ER_DISPLAY_FLEX;
+    er_node_set_props(child, &cp);
+    er_commit();
+
+    if (child_rec.count != 4 || child_rec.rect.x != 12 || child_rec.rect.y != 9 || child_rec.rect.w != 20)
+        return fail("layout event: shown child did not report its box again");
+
+    pp.display = ER_DISPLAY_NONE;
+    er_node_set_props(parent, &pp);
+    er_commit();
+
+    if (parent_rec.rect.w != 0 || parent_rec.rect.x != 0)
+        return fail("layout event: hidden parent did not report an empty box at 0,0");
+    if (child_rec.count != 4)
+        return fail("layout event: child of a hidden parent fired");
+
     return EXIT_SUCCESS;
 }
 
